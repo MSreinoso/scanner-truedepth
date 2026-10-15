@@ -1,0 +1,25 @@
+name: TrueDepth3DScanner
+options:
+  bundleIdPrefix: com.scanner3d
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  TrueDepth3DScanner:
+    type: application
+    platform: iOS
+    sources:
+      - TrueDepth3DScanner
+    info:
+      path: TrueDepth3DScanner/Info.plist
+      properties:
+        NSCameraUsageDescription: "Se requiere acceso a la cámara TrueDepth (Face ID) para capturar el mapa de profundidad y reconstruir la geometría 3D."
+        NSLocalNetworkUsageDescription: "Se utiliza la red Wi-Fi local para transmitir la vista del escáner 3D en tiempo real hacia el navegador de tu PC."
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.scanner3d.truedepthstl
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
