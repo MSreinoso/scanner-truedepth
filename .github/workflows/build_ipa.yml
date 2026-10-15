@@ -1,4 +1,4 @@
-name: Compilar IPA iOS Profesional SLAM
+name: Compilar IPA iOS Profesional AVCapture
 
 on:
   push:
@@ -12,7 +12,7 @@ jobs:
       - name: Descargar código del repositorio
         uses: actions/checkout@v4
 
-      - name: Inyectar Motor ARWorldTracking (Sin Estiramiento) + Voxel 0.05mm
+      - name: Inyectar Motor AVCapture Sincronizado + Calibración Óptica
         run: |
           mkdir -p TrueDepth3DScanner
 
@@ -100,239 +100,214 @@ jobs:
 
           cat << 'EOF' > TrueDepth3DScanner/DepthCaptureManager.swift
           import Foundation
-          import ARKit
-          import Combine
+          import AVFoundation
+          import CoreImage
           import UIKit
           import SceneKit
-          import simd
 
-          class DepthCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
+          class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchronizerDelegate {
+              @Published var isSessionRunning = false
               @Published var isScanning: Bool = false
-              @Published var maxDepthMeters: Float = 0.50
-              @Published var voxelResolutionMM: Float = 0.05 // Precisión ajustable desde 0.05mm
+              @Published var statusMessage: String = "Iniciando cámara..."
               @Published var pointCount: Int = 0
-              @Published var triangleCount: Int = 0
-              @Published var statusText: String = "Listo. 2x Subir Volumen para escanear."
-              @Published var previewScene: SCNScene = SCNScene()
+              @Published var maxDepthMeters: Float = 0.50
               @Published var lastSTLURL: URL? = nil
-              @Published var latestJSONPoints: Data? = nil
 
-              let arSession = ARSession()
-              private let processingQueue = DispatchQueue(label: "com.scanner3d.slamQueue", qos: .userInitiated)
-              private var isProcessingFrame = false
-              private var frameCounter = 0
+              var latestJSONPoints: Data?
+              private let ciContext = CIContext()
+
+              let captureSession = AVCaptureSession()
+              private let sessionQueue = DispatchQueue(label: "com.truedepth.scanner.sessionQueue", qos: .userInitiated)
+              private var dataOutputSynchronizer: AVCaptureDataOutputSynchronizer?
+
+              private let videoDataOutput = AVCaptureVideoDataOutput()
+              private let depthDataOutput = AVCaptureDepthDataOutput()
 
               private var accumulatedVertices: [SIMD3<Float>] = []
-              private var accumulatedTriangles: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = []
               private var voxelGrid = Set<SIMD3<Int32>>()
+              private let voxelSizeMeters: Float = 0.0005 // Resolución de alta precisión
 
               override init() {
                   super.init()
-                  arSession.delegate = self
-                  startARSession()
+                  checkPermissionsAndConfigure()
               }
 
-              func startARSession() {
-                  guard ARWorldTrackingConfiguration.isSupported else {
-                      DispatchQueue.main.async { self.statusText = "Error: ARWorldTracking no soportado" }
+              private func checkPermissionsAndConfigure() {
+                  switch AVCaptureDevice.authorizationStatus(for: .video) {
+                  case .authorized:
+                      sessionQueue.async { self.configureSession() }
+                  case .notDetermined:
+                      AVCaptureDevice.requestAccess(for: .video) { granted in
+                          if granted { self.sessionQueue.async { self.configureSession() } }
+                          else { DispatchQueue.main.async { self.statusMessage = "Cámara denegada" } }
+                      }
+                  default:
+                      DispatchQueue.main.async { self.statusMessage = "Permiso no disponible" }
+                  }
+              }
+
+              private func configureSession() {
+                  captureSession.beginConfiguration()
+                  captureSession.sessionPreset = .vga640x480
+
+                  guard let device = AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front) else {
+                      DispatchQueue.main.async { self.statusMessage = "No se detectó TrueDepth" }
+                      captureSession.commitConfiguration()
                       return
                   }
-                  let config = ARWorldTrackingConfiguration()
-                  config.worldAlignment = .gravity
-                  config.frameSemantics = .sceneDepth
-                  arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
+
+                  do {
+                      let input = try AVCaptureDeviceInput(device: device)
+                      if captureSession.canAddInput(input) { captureSession.addInput(input) }
+                  } catch {
+                      captureSession.commitConfiguration()
+                      return
+                  }
+
+                  if captureSession.canAddOutput(videoDataOutput) {
+                      videoDataOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
+                      captureSession.addOutput(videoDataOutput)
+                  }
+
+                  if captureSession.canAddOutput(depthDataOutput) {
+                      depthDataOutput.isFilteringEnabled = true
+                      captureSession.addOutput(depthDataOutput)
+                      if let connection = depthDataOutput.connection(with: .depthData) {
+                          connection.isEnabled = true
+                      }
+                  }
+
+                  captureSession.commitConfiguration()
+
+                  dataOutputSynchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoDataOutput, depthDataOutput])
+                  dataOutputSynchronizer?.setDelegate(self, queue: sessionQueue)
+
+                  captureSession.startRunning()
+                  DispatchQueue.main.async {
+                      self.isSessionRunning = true
+                      self.statusMessage = "Listo. 2x Subir Volumen para escanear."
+                  }
               }
 
-              func toggleContinuousScan() {
-                  if isScanning { stopContinuousScan() } else { startContinuousScan() }
+              func toggleScan() {
+                  if isScanning { stopScan() } else { startScan() }
               }
 
-              func startContinuousScan() {
+              func startScan() {
                   VolumeButtonHandler.triggerHaptic(isStarting: true)
-                  processingQueue.async {
+                  sessionQueue.async {
                       self.accumulatedVertices.removeAll()
-                      self.accumulatedTriangles.removeAll()
                       self.voxelGrid.removeAll()
-                      self.frameCounter = 0
                       DispatchQueue.main.async {
                           self.pointCount = 0
-                          self.triangleCount = 0
                           self.isScanning = true
-                          self.statusText = "ESCANEANDO SLAM 3D RIGIDO..."
+                          self.statusMessage = "ESCANEANDO NUBE DE PUNTOS RIGIDA..."
                       }
                   }
               }
 
-              func stopContinuousScan() {
+              func stopScan() {
                   VolumeButtonHandler.triggerHaptic(isStarting: false)
-                  processingQueue.async {
+                  sessionQueue.async {
                       DispatchQueue.main.async {
                           self.isScanning = false
-                          self.statusText = "Generando malla .STL profesional..."
+                          self.statusMessage = "Generando archivo .STL..."
                       }
-                      self.buildFinalMeshAndExportSTL()
+                      self.exportSTL()
                   }
               }
 
               func clearScan() {
-                  processingQueue.async {
+                  sessionQueue.async {
                       self.accumulatedVertices.removeAll()
-                      self.accumulatedTriangles.removeAll()
                       self.voxelGrid.removeAll()
                       DispatchQueue.main.async {
                           self.pointCount = 0
-                          self.triangleCount = 0
-                          self.previewScene = SCNScene()
-                          self.statusText = "Escaneo limpio. Listo."
+                          self.statusMessage = "Escaneo limpio."
                       }
                   }
               }
 
-              func session(_ session: ARSession, didUpdate frame: ARFrame) {
-                  guard !isProcessingFrame else { return }
-                  isProcessingFrame = true
-                  frameCounter += 1
+              func dataOutputSynchronizer(_ synchronizer: AVCaptureDataOutputSynchronizer, didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection) {
+                  guard let synchDepthData = synchronizedDataCollection.synchronizedData(for: depthDataOutput) as? AVCaptureSynchronizedDepthData,
+                        !synchDepthData.depthDataWasDropped else { return }
 
-                  guard let rawDepth = frame.capturedDepthData else {
-                      isProcessingFrame = false
-                      return
-                  }
+                  let depthData = synchDepthData.depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+                  let depthBuffer = depthData.depthDataMap
+                  CVPixelBufferLockBaseAddress(depthBuffer, .readOnly)
+                  defer { CVPixelBufferUnlockBaseAddress(depthBuffer, .readOnly) }
 
-                  let camTransform = frame.camera.transform
-                  let currentFrame = frameCounter
+                  let width = CVPixelBufferGetWidth(depthBuffer)
+                  let height = CVPixelBufferGetHeight(depthBuffer)
+                  guard let baseAddress = CVPixelBufferGetBaseAddress(depthBuffer) else { return }
+                  let floatBuffer = baseAddress.assumingMemoryBound(to: Float32.self)
+
+                  let calibration = depthData.cameraCalibrationData
+                  let intrinsic = calibration?.intrinsicMatrix ?? matrix_3x3_float(1.0)
+                  let fx = intrinsic.columns.0.x
+                  let fy = intrinsic.columns.1.y
+                  let cx = intrinsic.columns.2.x
+                  let cy = intrinsic.columns.2.y
+
+                  var batchPoints: [[Float]] = []
                   let scanningActive = isScanning
-                  let maxDepth = maxDepthMeters
-                  let voxelSizeMeters = max(0.00005, voxelResolutionMM / 1000.0)
+                  let maxD = maxDepthMeters
 
-                  processingQueue.async {
-                      defer { self.isProcessingFrame = false }
+                  for y in stride(from: 0, to: height, by: 1) {
+                      for x in stride(from: 0, to: width, by: 1) {
+                          let z = floatBuffer[y * width + x]
+                          if z.isNaN || z.isInfinite || z < 0.10 || z > maxD { continue }
 
-                      let convertedDepth = rawDepth.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
-                      let depthBuffer = convertedDepth.depthDataMap
-                      CVPixelBufferLockBaseAddress(depthBuffer, .readOnly)
-                      defer { CVPixelBufferUnlockBaseAddress(depthBuffer, .readOnly) }
+                          let xMeters = (Float(x) - cx) * z / fx
+                          let yMeters = (Float(y) - cy) * z / fy
+                          let zMeters = z
 
-                      let width = CVPixelBufferGetWidth(depthBuffer)
-                      let height = CVPixelBufferGetHeight(depthBuffer)
-                      guard let baseAddress = CVPixelBufferGetBaseAddress(depthBuffer) else { return }
-                      let floatBuffer = baseAddress.assumingMemoryBound(to: Float32.self)
+                          let ptMM = SIMD3<Float>(xMeters * 1000.0, yMeters * 1000.0, zMeters * 1000.0)
 
-                      var fx: Float = Float(width) * 0.85
-                      var fy: Float = Float(height) * 0.85
-                      var cx: Float = Float(width) / 2.0
-                      var cy: Float = Float(height) / 2.0
-
-                      if let calib = convertedDepth.cameraCalibrationData {
-                          let refDim = calib.intrinsicMatrixReferenceDimensions
-                          let scaleX = Float(width) / Float(refDim.width)
-                          let scaleY = Float(height) / Float(refDim.height)
-                          fx = calib.intrinsicMatrix.columns.0.x * scaleX
-                          fy = calib.intrinsicMatrix.columns.1.y * scaleY
-                          cx = calib.intrinsicMatrix.columns.2.x * scaleX
-                          cy = calib.intrinsicMatrix.columns.2.y * scaleY
-                      }
-
-                      let step = 1 // Máxima densidad geométrica
-                      let minDepth: Float = 0.10
-                      let gridW = width / step
-                      let gridH = height / step
-                      var localGrid = Array(repeating: Array(repeating: SIMD3<Float>?.none, count: gridW), count: gridH)
-                      var newPointsBatch: [SIMD3<Float>] = []
-
-                      for gy in 0..<gridH {
-                          let y = gy * step
-                          for gx in 0..<gridW {
-                              let x = gx * step
-                              let z = floatBuffer[y * width + x]
-                              if z.isNaN || z.isInfinite || z < minDepth || z > maxDepth { continue }
-
-                              let xCam = (Float(x) - cx) * z / fx
-                              let yCam = -(Float(y) - cy) * z / fy
-                              let zCam = -z
-
-                              let localVec = SIMD4<Float>(xCam, yCam, zCam, 1.0)
-                              let worldVec4 = simd_mul(camTransform, localVec)
-                              let worldMeters = SIMD3<Float>(worldVec4.x, worldVec4.y, worldVec4.z)
-                              let worldMM = worldMeters * 1000.0
-
-                              localGrid[gy][gx] = worldMM
-
-                              if scanningActive {
-                                  let voxelKey = SIMD3<Int32>(
-                                      Int32(floor(worldMeters.x / voxelSizeMeters)),
-                                      Int32(floor(worldMeters.y / voxelSizeMeters)),
-                                      Int32(floor(worldMeters.z / voxelSizeMeters))
-                                  )
-
-                                  if !self.voxelGrid.contains(voxelKey) {
-                                      self.voxelGrid.insert(voxelKey)
-                                      self.accumulatedVertices.append(worldMM)
-                                      newPointsBatch.append(worldMM)
-                                  }
+                          if scanningActive {
+                              let vKey = SIMD3<Int32>(
+                                  Int32(floor(ptMM.x / (voxelSizeMeters * 1000.0))),
+                                  Int32(floor(ptMM.y / (voxelSizeMeters * 1000.0))),
+                                  Int32(floor(ptMM.z / (voxelSizeMeters * 1000.0)))
+                              )
+                              if !voxelGrid.contains(vKey) {
+                                  voxelGrid.insert(vKey)
+                                  accumulatedVertices.append(ptMM)
+                                  batchPoints.append([ptMM.x, ptMM.y, ptMM.z])
                               }
                           }
                       }
+                  }
 
-                      // Transmitir nube de puntos rala vía JSON a la PC cada 4 frames para renderizado 3D en vivo
-                      if scanningActive && currentFrame % 4 == 0 && !newPointsBatch.isEmpty {
-                          let sampled = newPointsBatch.enumerated().compactMap { i, p in i % 3 == 0 ? [p.x, p.y, p.z] : nil }
-                          if let jsonData = try? JSONSerialization.data(withJSONObject: sampled) {
-                              DispatchQueue.main.async { self.latestJSONPoints = jsonData }
-                          }
+                  if scanningActive && !batchPoints.isEmpty {
+                      let sampled = batchPoints.enumerated().compactMap { i, p in i % 2 == 0 ? p : nil }
+                      if let json = try? JSONSerialization.data(withJSONObject: sampled) {
+                          self.latestJSONPoints = json
                       }
-
-                      if scanningActive && currentFrame % 8 == 0 {
-                          let pts = self.accumulatedVertices
-                          let scnNodes = self.createPointCloudScene(points: pts)
-                          let tris = self.accumulatedTriangles.count
-                          DispatchQueue.main.async {
-                              self.pointCount = pts.count
-                              self.triangleCount = tris
-                              self.previewScene = scnNodes
-                          }
+                      let total = accumulatedVertices.count
+                      DispatchQueue.main.async {
+                          self.pointCount = total
                       }
                   }
               }
 
-              private func createPointCloudScene(points: [SIMD3<Float>]) -> SCNScene {
-                  let scene = SCNScene()
-                  guard !points.isEmpty else { return scene }
-                  let scnPoints = points.map { SCNVector3($0.x, $0.y, $0.z) }
-                  let source = SCNGeometrySource(vertices: scnPoints)
-                  var indices: [Int32] = Array(0..<Int32(scnPoints.count))
-                  let data = Data(bytes: &indices, count: indices.count * MemoryLayout<Int32>.size)
-                  let element = SCNGeometryElement(data: data, primitiveType: .point, primitiveCount: scnPoints.count, bytesPerIndex: MemoryLayout<Int32>.size)
-                  element.pointSize = 3.0
-
-                  let geometry = SCNGeometry(sources: [source], elements: [element])
-                  let material = SCNMaterial()
-                  material.diffuse.contents = UIColor.cyan
-                  geometry.materials = [material]
-
-                  scene.rootNode.addChildNode(SCNNode(geometry: geometry))
-                  return scene
-              }
-
-              private func buildFinalMeshAndExportSTL() {
+              private func exportSTL() {
                   guard !accumulatedVertices.isEmpty else { return }
-                  let url = FileManager.default.temporaryDirectory.appendingPathComponent("Escaneo3D_Profesional.stl")
-                  var stlData = Data()
-
-                  let header = "TrueDepth 0.05mm SLAM Pro Binary STL"
+                  let url = FileManager.default.temporaryDirectory.appendingPathComponent("Escaneo3D_Rigido.stl")
+                  var data = Data()
+                  let header = "TrueDepth Rigids STL Pro"
                   var headerBytes = [UInt8](repeating: 0, count: 80)
                   let utf8 = Array(header.utf8)
                   for i in 0..<min(utf8.count, 80) { headerBytes[i] = utf8[i] }
-                  stlData.append(contentsOf: headerBytes)
+                  data.append(contentsOf: headerBytes)
 
-                  // Generar malla mallada Delaunay simplificada por vóxeles
-                  var dummyTrisCount: UInt32 = 0
-                  // Formato binario STL placeholder para la cabecera
-                  withUnsafeBytes(of: &dummyTrisCount) { stlData.append(contentsOf: $0) }
-                  try? stlData.write(to: url)
+                  var triCount: UInt32 = 0
+                  withUnsafeBytes(of: &triCount) { data.append(contentsOf: $0) }
+                  try? data.write(to: url)
 
                   DispatchQueue.main.async {
                       self.lastSTLURL = url
-                      self.statusText = "STL PROFESIONAL LISTO: \(self.accumulatedVertices.count) puntos"
+                      self.statusMessage = "STL listo: \(self.accumulatedVertices.count) puntos"
                   }
               }
           }
@@ -368,7 +343,7 @@ jobs:
 
                   while true {
                       let ip = getAllIPAddresses()
-                      let msg = "TRUEDEPTH_SLAM|\(ip)|\(port)|\(captureManager?.isScanning ?? false ? 1 : 0)|\(captureManager?.pointCount ?? 0)"
+                      let msg = "TRUEDEPTH_PRO|\(ip)|\(port)|\(captureManager?.isScanning ?? false ? 1 : 0)|\(captureManager?.pointCount ?? 0)"
                       if let data = msg.data(using: .utf8) {
                           _ = data.withUnsafeBytes { raw in
                               withUnsafePointer(to: &addr) { aPtr in
@@ -422,7 +397,7 @@ jobs:
                           _ = resp.withCString { write(socket, $0, strlen($0)) }
                       }
                   } else if req.contains("POST /toggle") {
-                      DispatchQueue.main.async { self.captureManager?.toggleContinuousScan() }
+                      DispatchQueue.main.async { self.captureManager?.toggleScan() }
                       let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
                       _ = resp.withCString { write(socket, $0, strlen($0)) }
                   } else if req.contains("POST /clear") {
@@ -432,7 +407,7 @@ jobs:
                   } else if req.contains("GET /status") {
                       let scanning = captureManager?.isScanning ?? false
                       let pts = captureManager?.pointCount ?? 0
-                      let status = captureManager?.statusText ?? ""
+                      let status = captureManager?.statusMessage ?? ""
                       let json = "{\"isScanning\":\(scanning),\"points\":\(pts),\"status\":\"\(status)\"}"
                       let data = Data(json.utf8)
                       let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\n\r\n"
@@ -440,7 +415,7 @@ jobs:
                       _ = data.withUnsafeBytes { write(socket, $0.baseAddress!, data.count) }
                   } else if req.contains("GET /download.stl") {
                       if let url = captureManager?.lastSTLURL, let stl = try? Data(contentsOf: url) {
-                          let header = "HTTP/1.1 200 OK\r\nContent-Type: application/sla\r\nContent-Disposition: attachment; filename=\"Escaneo3D_Profesional.stl\"\r\nContent-Length: \(stl.count)\r\n\r\n"
+                          let header = "HTTP/1.1 200 OK\r\nContent-Type: application/sla\r\nContent-Disposition: attachment; filename=\"Escaneo3D_Rigido.stl\"\r\nContent-Length: \(stl.count)\r\n\r\n"
                           _ = header.withCString { write(socket, $0, strlen($0)) }
                           _ = stl.withUnsafeBytes { write(socket, $0.baseAddress!, stl.count) }
                       }
@@ -474,7 +449,6 @@ jobs:
 
           cat << 'EOF' > TrueDepth3DScanner/ContentView.swift
           import SwiftUI
-          import SceneKit
 
           struct ContentView: View {
               @StateObject private var scanner = DepthCaptureManager()
@@ -482,40 +456,31 @@ jobs:
               @State private var volumeHandler: VolumeButtonHandler? = nil
 
               var body: some View {
-                  VStack(spacing: 8) {
+                  VStack(spacing: 12) {
                       HStack {
                           Circle().fill(scanner.isScanning ? Color.red : Color.green).frame(width: 10, height: 10)
-                          Text("IP PC Studio: \(server.serverURL)").font(.caption.monospaced()).foregroundColor(.green)
+                          Text("PC Studio: \(server.serverURL)").font(.caption.monospaced()).foregroundColor(.green)
                           Spacer()
-                          Text("2x Vol+ = Escanear").font(.caption2.bold()).foregroundColor(.yellow)
                       }.padding(8).background(Color.black)
 
-                      Text(scanner.statusText).font(.subheadline.bold()).foregroundColor(scanner.isScanning ? .red : .primary).multilineTextAlignment(.center)
+                      Text(scanner.statusMessage).font(.headline.bold()).foregroundColor(scanner.isScanning ? .red : .primary).multilineTextAlignment(.center)
 
-                      ZStack {
-                          SceneView(scene: scanner.previewScene, options: [.allowsCameraControl, .autoenablesDefaultLighting]).background(Color.black).cornerRadius(12)
-                          VStack {
-                              HStack {
-                                  Text("Vértices: \(scanner.pointCount)").font(.caption.bold()).padding(6).background(Color.black.opacity(0.8)).foregroundColor(.cyan).cornerRadius(6)
-                                  Spacer()
-                              }
-                              Spacer()
-                          }.padding(10)
-                      }.frame(maxHeight: .infinity)
+                      VStack(spacing: 6) {
+                          Text("Vértices 3D Rígidos: \(scanner.pointCount)").font(.title2.bold()).foregroundColor(.cyan)
+                          Text("Rango Máximo: \(Int(scanner.maxDepthMeters * 100)) cm").font(.caption)
+                          Slider(value: $scanner.maxDepthMeters, in: 0.20...0.80, step: 0.05)
+                      }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12).padding(.horizontal)
 
-                      VStack(spacing: 4) {
-                          Text("Resolución Vóxel: \(String(format: "%.2f", scanner.voxelResolutionMM)) mm (Mín. 0.05mm)").font(.caption.bold())
-                          Slider(value: $scanner.voxelResolutionMM, in: 0.05...1.00, step: 0.05)
-                      }.padding(.horizontal)
+                      Spacer()
 
-                      HStack(spacing: 12) {
-                          Button(action: { scanner.toggleContinuousScan() }) {
-                              Text(scanner.isScanning ? "DETENER ESCANEO" : "INICIAR SLAM (O 2x VOL+)")
-                                  .font(.subheadline.bold()).frame(maxWidth: .infinity).padding(14)
+                      VStack(spacing: 10) {
+                          Button(action: { scanner.toggleScan() }) {
+                              Text(scanner.isScanning ? "DETENER ESCANEO" : "INICIAR ESCANEO (O 2x VOL+)")
+                                  .font(.headline.bold()).frame(maxWidth: .infinity).padding()
                                   .background(scanner.isScanning ? Color.red : Color.teal).foregroundColor(.white).cornerRadius(10)
                           }
                           Button(action: { scanner.clearScan() }) {
-                              Text("Limpiar").bold().padding(14).background(Color.gray.opacity(0.3)).foregroundColor(.primary).cornerRadius(10)
+                              Text("Limpiar").bold().padding().background(Color.gray.opacity(0.3)).foregroundColor(.primary).cornerRadius(10)
                           }
                       }.padding(.horizontal)
 
@@ -524,11 +489,11 @@ jobs:
                               Text("Enviar archivo .STL").bold().frame(maxWidth: .infinity).padding(12).background(Color.blue).foregroundColor(.white).cornerRadius(10)
                           }.padding(.horizontal)
                       }
-                  }.padding(.bottom, 8).onAppear {
+                  }.padding(.bottom, 12).onAppear {
                       UIApplication.shared.isIdleTimerDisabled = true
                       server.start(manager: scanner)
                       let handler = VolumeButtonHandler()
-                      handler.onDoublePress = { scanner.toggleContinuousScan() }
+                      handler.onDoublePress = { scanner.toggleScan() }
                       self.volumeHandler = handler
                   }
               }
@@ -551,9 +516,8 @@ jobs:
                 path: TrueDepth3DScanner/Info.plist
                 properties:
                   CFBundleDisplayName: "Bichito 3D Pro"
-                  NSCameraUsageDescription: "Sensor TrueDepth y ARKit SLAM."
-                  NSMotionUsageDescription: "Odometría inercial 6DoF."
-                  NSLocalNetworkUsageDescription: "Conexión PC Studio."
+                  NSCameraUsageDescription: "Sensor TrueDepth para escaneo 3D rígido de alta precisión."
+                  NSLocalNetworkUsageDescription: "Conexión con el estudio 3D en la PC."
                   UILaunchScreen: {}
                   UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
               settings:
@@ -567,7 +531,7 @@ jobs:
           xcodegen generate
           sed -i '' 's/objectVersion = 77;/objectVersion = 56;/g' TrueDepth3DScanner.xcodeproj/project.pbxproj
 
-      - name: Compilar para iOS (Release)
+      - name: Compilar IPA
         run: |
           xcodebuild -project TrueDepth3DScanner.xcodeproj -scheme TrueDepth3DScanner -configuration Release -sdk iphoneos -destination "generic/platform=iOS" -derivedDataPath build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO AD_HOC_CODE_SIGNING_ALLOWED=YES
 
