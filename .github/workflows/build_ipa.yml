@@ -1,0 +1,41 @@
+name: Compilar IPA iOS
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-14
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Generar proyecto Xcode con XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Compilar aplicación para iPhone (Release)
+        run: |
+          xcodebuild -project TrueDepth3DScanner.xcodeproj \
+            -scheme TrueDepth3DScanner \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Empaquetar en archivo .ipa
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/TrueDepth3DScanner.app Payload/
+          zip -r TrueDepth3DScanner.ipa Payload
+
+      - name: Subir archivo IPA listo para Sideloadly
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrueDepth3DScanner-IPA
+          path: TrueDepth3DScanner.ipa
