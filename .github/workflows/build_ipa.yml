@@ -12,7 +12,7 @@ jobs:
       - name: Descargar código del repositorio
         uses: actions/checkout@v4
 
-      - name: Inyectar Motor AVCapture Sincronizado + Calibración Óptica
+      - name: Inyectar Motor AVCapture Sincronizado Corregido
         run: |
           mkdir -p TrueDepth3DScanner
 
@@ -104,6 +104,7 @@ jobs:
           import CoreImage
           import UIKit
           import SceneKit
+          import simd
 
           class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchronizerDelegate {
               @Published var isSessionRunning = false
@@ -125,7 +126,7 @@ jobs:
 
               private var accumulatedVertices: [SIMD3<Float>] = []
               private var voxelGrid = Set<SIMD3<Int32>>()
-              private let voxelSizeMeters: Float = 0.0005 // Resolución de alta precisión
+              private let voxelSizeMeters: Float = 0.0005
 
               override init() {
                   super.init()
@@ -243,7 +244,8 @@ jobs:
                   let floatBuffer = baseAddress.assumingMemoryBound(to: Float32.self)
 
                   let calibration = depthData.cameraCalibrationData
-                  let intrinsic = calibration?.intrinsicMatrix ?? matrix_3x3_float(1.0)
+                  // Corregido: uso de matrix_identity_float3x3 para compatibilidad estricta con Swift/SIMD
+                  let intrinsic = calibration?.intrinsicMatrix ?? matrix_identity_float3x3
                   let fx = intrinsic.columns.0.x
                   let fy = intrinsic.columns.1.y
                   let cx = intrinsic.columns.2.x
