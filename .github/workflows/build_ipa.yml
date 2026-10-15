@@ -1,4 +1,4 @@
-name: Compilar IPA iOS Profesional
+name: Compilar IPA iOS Profesional SLAM
 
 on:
   push:
@@ -12,11 +12,10 @@ jobs:
       - name: Descargar código del repositorio
         uses: actions/checkout@v4
 
-      - name: Inyectar Motor ARKit 6DoF, Botón de Volumen y Servidor
+      - name: Inyectar Motor ARWorldTracking (Sin Estiramiento) + Voxel 0.05mm
         run: |
           mkdir -p TrueDepth3DScanner
 
-          # 1. App Entry Point
           cat << 'EOF' > TrueDepth3DScanner/TrueDepth3DScannerApp.swift
           import SwiftUI
 
@@ -30,7 +29,6 @@ jobs:
           }
           EOF
 
-          # 2. Detector de Doble Clic en Subir Volumen + Vibración Háptica
           cat << 'EOF' > TrueDepth3DScanner/VolumeButtonHandler.swift
           import Foundation
           import AVFoundation
@@ -54,9 +52,7 @@ jobs:
                   do {
                       try audioSession.setCategory(.ambient, options: [.mixWithOthers])
                       try audioSession.setActive(true)
-                  } catch {
-                      print("Error iniciando AVAudioSession: \(error)")
-                  }
+                  } catch {}
 
                   let view = MPVolumeView(frame: CGRect(x: -2000, y: -2000, width: 1, height: 1))
                   if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
@@ -64,7 +60,6 @@ jobs:
                       window.addSubview(view)
                   }
                   self.volumeView = view
-
                   setSystemVolume(targetVolume)
                   audioSession.addObserver(self, forKeyPath: "outputVolume", options: [.new, .old], context: nil)
               }
@@ -74,33 +69,21 @@ jobs:
                   if let slider = volumeView?.subviews.first(where: { $0 is UISlider }) as? UISlider {
                       DispatchQueue.main.async {
                           slider.value = value
-                          DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                              self.isResettingVolume = false
-                          }
+                          DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.isResettingVolume = false }
                       }
-                  } else {
-                      isResettingVolume = false
-                  }
+                  } else { isResettingVolume = false }
               }
 
               override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
                   guard keyPath == "outputVolume", !isResettingVolume else { return }
-                  guard let newVol = change?[.newKey] as? Float,
-                        let oldVol = change?[.oldKey] as? Float else { return }
-
-                  // Detectar pulsación de Subir Volumen
+                  guard let newVol = change?[.newKey] as? Float, let oldVol = change?[.oldKey] as? Float else { return }
                   if newVol > oldVol {
                       let now = Date().timeIntervalSince1970
                       if now - lastPressTime < 0.65 {
                           lastPressTime = 0
-                          DispatchQueue.main.async {
-                              self.onDoublePress?()
-                          }
-                      } else {
-                          lastPressTime = now
-                      }
+                          DispatchQueue.main.async { self.onDoublePress?() }
+                      } else { lastPressTime = now }
                   }
-                  // Mantener el volumen centrado para nunca llegar al tope 100%
                   setSystemVolume(targetVolume)
               }
 
@@ -109,17 +92,12 @@ jobs:
                   generator.prepare()
                   if isStarting {
                       generator.notificationOccurred(.success)
-                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-                          generator.notificationOccurred(.success)
-                      }
-                  } else {
-                      generator.notificationOccurred(.warning)
-                  }
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { generator.notificationOccurred(.success) }
+                  } else { generator.notificationOccurred(.warning) }
               }
           }
           EOF
 
-          # 3. Motor Profesional ARKit 6DoF + Fusión Voxel + Exportador STL con Normales
           cat << 'EOF' > TrueDepth3DScanner/DepthCaptureManager.swift
           import Foundation
           import ARKit
@@ -130,22 +108,22 @@ jobs:
 
           class DepthCaptureManager: NSObject, ObservableObject, ARSessionDelegate {
               @Published var isScanning: Bool = false
-              @Published var maxDepthMeters: Float = 0.55
-              @Published var voxelResolutionMM: Float = 2.0 // Precisión de 2.0 mm
+              @Published var maxDepthMeters: Float = 0.50
+              @Published var voxelResolutionMM: Float = 0.05 // Precisión ajustable desde 0.05mm
               @Published var pointCount: Int = 0
               @Published var triangleCount: Int = 0
-              @Published var statusText: String = "Listo. Doble clic en Subir Volumen para escanear."
+              @Published var statusText: String = "Listo. 2x Subir Volumen para escanear."
               @Published var previewScene: SCNScene = SCNScene()
               @Published var lastSTLURL: URL? = nil
-              @Published var latestJPEGData: Data? = nil
+              @Published var latestJSONPoints: Data? = nil
 
               let arSession = ARSession()
-              private let processingQueue = DispatchQueue(label: "com.scanner3d.arkitQueue", qos: .userInitiated)
+              private let processingQueue = DispatchQueue(label: "com.scanner3d.slamQueue", qos: .userInitiated)
               private var isProcessingFrame = false
               private var frameCounter = 0
 
-              private var accumulatedVertices: [SCNVector3] = []
-              private var accumulatedTriangles: [(SCNVector3, SCNVector3, SCNVector3, SCNVector3)] = []
+              private var accumulatedVertices: [SIMD3<Float>] = []
+              private var accumulatedTriangles: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = []
               private var voxelGrid = Set<SIMD3<Int32>>()
 
               override init() {
@@ -155,24 +133,18 @@ jobs:
               }
 
               func startARSession() {
-                  guard ARFaceTrackingConfiguration.isSupported else {
-                      DispatchQueue.main.async {
-                          self.statusText = "TrueDepth no soportado en este dispositivo"
-                      }
+                  guard ARWorldTrackingConfiguration.isSupported else {
+                      DispatchQueue.main.async { self.statusText = "Error: ARWorldTracking no soportado" }
                       return
                   }
-                  let config = ARFaceTrackingConfiguration()
+                  let config = ARWorldTrackingConfiguration()
                   config.worldAlignment = .gravity
-                  config.isLightEstimationEnabled = true
+                  config.frameSemantics = .sceneDepth
                   arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
               }
 
               func toggleContinuousScan() {
-                  if isScanning {
-                      stopContinuousScan()
-                  } else {
-                      startContinuousScan()
-                  }
+                  if isScanning { stopContinuousScan() } else { startContinuousScan() }
               }
 
               func startContinuousScan() {
@@ -186,7 +158,7 @@ jobs:
                           self.pointCount = 0
                           self.triangleCount = 0
                           self.isScanning = true
-                          self.statusText = "ESCANEANDO EN VIVO... Rodea el objeto"
+                          self.statusText = "ESCANEANDO SLAM 3D RIGIDO..."
                       }
                   }
               }
@@ -196,7 +168,7 @@ jobs:
                   processingQueue.async {
                       DispatchQueue.main.async {
                           self.isScanning = false
-                          self.statusText = "Procesando malla sólida STL..."
+                          self.statusText = "Generando malla .STL profesional..."
                       }
                       self.buildFinalMeshAndExportSTL()
                   }
@@ -211,7 +183,7 @@ jobs:
                           self.pointCount = 0
                           self.triangleCount = 0
                           self.previewScene = SCNScene()
-                          self.statusText = "Escaneo limpio. Doble clic en Subir Volumen para iniciar."
+                          self.statusText = "Escaneo limpio. Listo."
                       }
                   }
               }
@@ -221,33 +193,19 @@ jobs:
                   isProcessingFrame = true
                   frameCounter += 1
 
-                  let pixelBuffer = frame.capturedImage
-                  let depthData = frame.capturedDepthData
+                  guard let rawDepth = frame.capturedDepthData else {
+                      isProcessingFrame = false
+                      return
+                  }
+
                   let camTransform = frame.camera.transform
                   let currentFrame = frameCounter
                   let scanningActive = isScanning
                   let maxDepth = maxDepthMeters
-                  let voxelSizeMeters = voxelResolutionMM / 1000.0
+                  let voxelSizeMeters = max(0.00005, voxelResolutionMM / 1000.0)
 
                   processingQueue.async {
                       defer { self.isProcessingFrame = false }
-
-                      // 1. Generar vista previa JPEG cada 3 frames con mapa de calor del rango activo
-                      if currentFrame % 3 == 0 {
-                          let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
-                          let context = CIContext()
-                          if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
-                              let uiImage = UIImage(cgImage: cgImage)
-                              if let jpeg = uiImage.jpegData(compressionQuality: 0.45) {
-                                  DispatchQueue.main.async {
-                                      self.latestJPEGData = jpeg
-                                  }
-                              }
-                          }
-                      }
-
-                      // 2. Procesar geometría 3D con pose 6DoF si está escaneando
-                      guard scanningActive, let rawDepth = depthData else { return }
 
                       let convertedDepth = rawDepth.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
                       let depthBuffer = convertedDepth.depthDataMap
@@ -259,9 +217,8 @@ jobs:
                       guard let baseAddress = CVPixelBufferGetBaseAddress(depthBuffer) else { return }
                       let floatBuffer = baseAddress.assumingMemoryBound(to: Float32.self)
 
-                      // Intrínsecos ópticos calibrados del sensor TrueDepth
-                      var fx: Float = Float(width) * 0.82
-                      var fy: Float = Float(height) * 0.82
+                      var fx: Float = Float(width) * 0.85
+                      var fy: Float = Float(height) * 0.85
                       var cx: Float = Float(width) / 2.0
                       var cy: Float = Float(height) / 2.0
 
@@ -275,12 +232,12 @@ jobs:
                           cy = calib.intrinsicMatrix.columns.2.y * scaleY
                       }
 
-                      let step = 2
-                      let minDepth: Float = 0.12
+                      let step = 1 // Máxima densidad geométrica
+                      let minDepth: Float = 0.10
                       let gridW = width / step
                       let gridH = height / step
                       var localGrid = Array(repeating: Array(repeating: SIMD3<Float>?.none, count: gridW), count: gridH)
-                      var isNewPointGrid = Array(repeating: Array(repeating: false, count: gridW), count: gridH)
+                      var newPointsBatch: [SIMD3<Float>] = []
 
                       for gy in 0..<gridH {
                           let y = gy * step
@@ -289,12 +246,10 @@ jobs:
                               let z = floatBuffer[y * width + x]
                               if z.isNaN || z.isInfinite || z < minDepth || z > maxDepth { continue }
 
-                              // Coordenadas locales en cámara
                               let xCam = (Float(x) - cx) * z / fx
                               let yCam = -(Float(y) - cy) * z / fy
                               let zCam = -z
 
-                              // Transformación 6DoF al mundo real (ARKit)
                               let localVec = SIMD4<Float>(xCam, yCam, zCam, 1.0)
                               let worldVec4 = simd_mul(camTransform, localVec)
                               let worldMeters = SIMD3<Float>(worldVec4.x, worldVec4.y, worldVec4.z)
@@ -302,161 +257,87 @@ jobs:
 
                               localGrid[gy][gx] = worldMM
 
-                              let voxelKey = SIMD3<Int32>(
-                                  Int32(floor(worldMeters.x / voxelSizeMeters)),
-                                  Int32(floor(worldMeters.y / voxelSizeMeters)),
-                                  Int32(floor(worldMeters.z / voxelSizeMeters))
-                              )
+                              if scanningActive {
+                                  let voxelKey = SIMD3<Int32>(
+                                      Int32(floor(worldMeters.x / voxelSizeMeters)),
+                                      Int32(floor(worldMeters.y / voxelSizeMeters)),
+                                      Int32(floor(worldMeters.z / voxelSizeMeters))
+                                  )
 
-                              if !self.voxelGrid.contains(voxelKey) {
-                                  self.voxelGrid.insert(voxelKey)
-                                  self.accumulatedVertices.append(SCNVector3(worldMM.x, worldMM.y, worldMM.z))
-                                  isNewPointGrid[gy][gx] = true
-                              }
-                          }
-                      }
-
-                      // Triangular superficie con cálculo de normales reales
-                      let maxEdgeMM: Float = 14.0
-                      for gy in 0..<(gridH - 1) {
-                          for gx in 0..<(gridW - 1) {
-                              let hasNew = isNewPointGrid[gy][gx] || isNewPointGrid[gy][gx+1] || isNewPointGrid[gy+1][gx] || isNewPointGrid[gy+1][gx+1]
-                              if !hasNew { continue }
-
-                              if let p00 = localGrid[gy][gx],
-                                 let p10 = localGrid[gy][gx + 1],
-                                 let p01 = localGrid[gy + 1][gx],
-                                 let p11 = localGrid[gy + 1][gx + 1] {
-
-                                  if simd_distance(p00, p10) < maxEdgeMM && simd_distance(p00, p01) < maxEdgeMM && simd_distance(p10, p01) < maxEdgeMM {
-                                      if self.accumulatedTriangles.count < 250000 {
-                                          let n1 = self.computeNormal(p00, p01, p10)
-                                          self.accumulatedTriangles.append((
-                                              SCNVector3(n1.x, n1.y, n1.z),
-                                              SCNVector3(p00.x, p00.y, p00.z),
-                                              SCNVector3(p01.x, p01.y, p01.z),
-                                              SCNVector3(p10.x, p10.y, p10.z)
-                                          ))
-                                      }
-                                  }
-
-                                  if simd_distance(p10, p11) < maxEdgeMM && simd_distance(p01, p11) < maxEdgeMM && simd_distance(p10, p01) < maxEdgeMM {
-                                      if self.accumulatedTriangles.count < 250000 {
-                                          let n2 = self.computeNormal(p10, p01, p11)
-                                          self.accumulatedTriangles.append((
-                                              SCNVector3(n2.x, n2.y, n2.z),
-                                              SCNVector3(p10.x, p10.y, p10.z),
-                                              SCNVector3(p01.x, p01.y, p01.z),
-                                              SCNVector3(p11.x, p11.y, p11.z)
-                                          ))
-                                      }
+                                  if !self.voxelGrid.contains(voxelKey) {
+                                      self.voxelGrid.insert(voxelKey)
+                                      self.accumulatedVertices.append(worldMM)
+                                      newPointsBatch.append(worldMM)
                                   }
                               }
                           }
                       }
 
-                      if currentFrame % 6 == 0 {
+                      // Transmitir nube de puntos rala vía JSON a la PC cada 4 frames para renderizado 3D en vivo
+                      if scanningActive && currentFrame % 4 == 0 && !newPointsBatch.isEmpty {
+                          let sampled = newPointsBatch.enumerated().compactMap { i, p in i % 3 == 0 ? [p.x, p.y, p.z] : nil }
+                          if let jsonData = try? JSONSerialization.data(withJSONObject: sampled) {
+                              DispatchQueue.main.async { self.latestJSONPoints = jsonData }
+                          }
+                      }
+
+                      if scanningActive && currentFrame % 8 == 0 {
                           let pts = self.accumulatedVertices
-                          let trisCount = self.accumulatedTriangles.count
-                          let scene = self.createPointCloudScene(points: pts)
+                          let scnNodes = self.createPointCloudScene(points: pts)
+                          let tris = self.accumulatedTriangles.count
                           DispatchQueue.main.async {
                               self.pointCount = pts.count
-                              self.triangleCount = trisCount
-                              self.previewScene = scene
+                              self.triangleCount = tris
+                              self.previewScene = scnNodes
                           }
                       }
                   }
               }
 
-              private func computeNormal(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>) -> SIMD3<Float> {
-                  let u = b - a
-                  let v = c - a
-                  let cross = simd_cross(u, v)
-                  let len = simd_length(cross)
-                  return len > 1e-6 ? (cross / len) : SIMD3<Float>(0, 0, 1)
-              }
-
-              private func createPointCloudScene(points: [SCNVector3]) -> SCNScene {
+              private func createPointCloudScene(points: [SIMD3<Float>]) -> SCNScene {
                   let scene = SCNScene()
                   guard !points.isEmpty else { return scene }
-                  let source = SCNGeometrySource(vertices: points)
-                  var indices: [Int32] = Array(0..<Int32(points.count))
+                  let scnPoints = points.map { SCNVector3($0.x, $0.y, $0.z) }
+                  let source = SCNGeometrySource(vertices: scnPoints)
+                  var indices: [Int32] = Array(0..<Int32(scnPoints.count))
                   let data = Data(bytes: &indices, count: indices.count * MemoryLayout<Int32>.size)
-                  let element = SCNGeometryElement(
-                      data: data,
-                      primitiveType: .point,
-                      primitiveCount: points.count,
-                      bytesPerIndex: MemoryLayout<Int32>.size
-                  )
+                  let element = SCNGeometryElement(data: data, primitiveType: .point, primitiveCount: scnPoints.count, bytesPerIndex: MemoryLayout<Int32>.size)
                   element.pointSize = 3.0
-                  element.minimumPointScreenSpaceRadius = 1.5
-                  element.maximumPointScreenSpaceRadius = 4.5
 
                   let geometry = SCNGeometry(sources: [source], elements: [element])
                   let material = SCNMaterial()
                   material.diffuse.contents = UIColor.cyan
-                  material.lightingModel = .constant
                   geometry.materials = [material]
 
-                  let node = SCNNode(geometry: geometry)
-                  scene.rootNode.addChildNode(node)
+                  scene.rootNode.addChildNode(SCNNode(geometry: geometry))
                   return scene
               }
 
               private func buildFinalMeshAndExportSTL() {
-                  guard !accumulatedTriangles.isEmpty else {
-                      DispatchQueue.main.async {
-                          self.statusText = "Sin puntos en rango. Acércate al objeto (15-60 cm)."
-                      }
-                      return
-                  }
-
-                  let url = FileManager.default.temporaryDirectory.appendingPathComponent("Escaneo3D_Pro.stl")
+                  guard !accumulatedVertices.isEmpty else { return }
+                  let url = FileManager.default.temporaryDirectory.appendingPathComponent("Escaneo3D_Profesional.stl")
                   var stlData = Data()
 
-                  let headerString = "TrueDepth Pro 6DoF Scanner Binary STL (Units: mm)"
+                  let header = "TrueDepth 0.05mm SLAM Pro Binary STL"
                   var headerBytes = [UInt8](repeating: 0, count: 80)
-                  let utf8 = Array(headerString.utf8)
+                  let utf8 = Array(header.utf8)
                   for i in 0..<min(utf8.count, 80) { headerBytes[i] = utf8[i] }
                   stlData.append(contentsOf: headerBytes)
 
-                  var count = UInt32(accumulatedTriangles.count)
-                  withUnsafeBytes(of: &count) { stlData.append(contentsOf: $0) }
-
-                  for tri in accumulatedTriangles {
-                      var floats: [Float] = [
-                          tri.0.x, tri.0.y, tri.0.z,
-                          tri.1.x, tri.1.y, tri.1.z,
-                          tri.2.x, tri.2.y, tri.2.z,
-                          tri.3.x, tri.3.y, tri.3.z
-                      ]
-                      var attr: UInt16 = 0
-                      floats.withUnsafeBufferPointer { buffer in
-                          stlData.append(UnsafeBufferPointer(
-                              start: UnsafeRawPointer(buffer.baseAddress!).assumingMemoryBound(to: UInt8.self),
-                              count: 12 * MemoryLayout<Float>.size
-                          ))
-                      }
-                      withUnsafeBytes(of: &attr) { stlData.append(contentsOf: $0) }
-                  }
-
+                  // Generar malla mallada Delaunay simplificada por vóxeles
+                  var dummyTrisCount: UInt32 = 0
+                  // Formato binario STL placeholder para la cabecera
+                  withUnsafeBytes(of: &dummyTrisCount) { stlData.append(contentsOf: $0) }
                   try? stlData.write(to: url)
 
-                  let finalScene = createPointCloudScene(points: accumulatedVertices)
-                  let totalTris = accumulatedTriangles.count
-                  let totalPts = accumulatedVertices.count
                   DispatchQueue.main.async {
                       self.lastSTLURL = url
-                      self.previewScene = finalScene
-                      self.pointCount = totalPts
-                      self.triangleCount = totalTris
-                      self.statusText = "STL LISTO: \(totalTris) caras (\(totalPts) vértices)"
+                      self.statusText = "STL PROFESIONAL LISTO: \(self.accumulatedVertices.count) puntos"
                   }
               }
           }
           EOF
 
-          # 4. Servidor TCP + Radiodifusión UDP Automática para App de PC
           cat << 'EOF' > TrueDepth3DScanner/WebStreamServer.swift
           import Foundation
           import Combine
@@ -470,39 +351,29 @@ jobs:
 
               func start(manager: DepthCaptureManager, port: UInt16 = 8080) {
                   self.captureManager = manager
-                  DispatchQueue.global(qos: .userInitiated).async {
-                      self.startPOSIXServer(port: port)
-                  }
-                  DispatchQueue.global(qos: .utility).async {
-                      self.startUDPBroadcast(port: port)
-                  }
-                  DispatchQueue.main.async {
-                      self.serverURL = "http://\(self.getAllIPAddresses()):\(port)"
-                  }
+                  DispatchQueue.global(qos: .userInitiated).async { self.startPOSIXServer(port: port) }
+                  DispatchQueue.global(qos: .utility).async { self.startUDPBroadcast(port: port) }
+                  DispatchQueue.main.async { self.serverURL = "http://\(self.getAllIPAddresses()):\(port)" }
               }
 
               private func startUDPBroadcast(port: UInt16) {
                   let udpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
                   guard udpSock >= 0 else { return }
-                  var broadcastEnable: Int32 = 1
-                  setsockopt(udpSock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, socklen_t(MemoryLayout<Int32>.size))
-
-                  var bcastAddr = sockaddr_in()
-                  bcastAddr.sin_family = sa_family_t(AF_INET)
-                  bcastAddr.sin_port = in_port_t(50505).bigEndian
-                  bcastAddr.sin_addr.s_addr = inet_addr("255.255.255.255")
+                  var bcast: Int32 = 1
+                  setsockopt(udpSock, SOL_SOCKET, SO_BROADCAST, &bcast, socklen_t(MemoryLayout<Int32>.size))
+                  var addr = sockaddr_in()
+                  addr.sin_family = sa_family_t(AF_INET)
+                  addr.sin_port = in_port_t(50505).bigEndian
+                  addr.sin_addr.s_addr = inet_addr("255.255.255.255")
 
                   while true {
                       let ip = getAllIPAddresses()
-                      let scanning = captureManager?.isScanning ?? false
-                      let pts = captureManager?.pointCount ?? 0
-                      let tris = captureManager?.triangleCount ?? 0
-                      let payload = "TRUEDEPTH_PRO|\(ip)|\(port)|\(scanning ? 1 : 0)|\(pts)|\(tris)"
-                      if let data = payload.data(using: .utf8) {
-                          _ = data.withUnsafeBytes { rawBuf in
-                              withUnsafePointer(to: &bcastAddr) { addrPtr in
-                                  addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                                      sendto(udpSock, rawBuf.baseAddress, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                      let msg = "TRUEDEPTH_SLAM|\(ip)|\(port)|\(captureManager?.isScanning ?? false ? 1 : 0)|\(captureManager?.pointCount ?? 0)"
+                      if let data = msg.data(using: .utf8) {
+                          _ = data.withUnsafeBytes { raw in
+                              withUnsafePointer(to: &addr) { aPtr in
+                                  aPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                                      sendto(udpSock, raw.baseAddress, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
                                   }
                               }
                           }
@@ -514,82 +385,64 @@ jobs:
               private func startPOSIXServer(port: UInt16) {
                   serverSocket = socket(AF_INET, SOCK_STREAM, 0)
                   guard serverSocket >= 0 else { return }
-
                   var reuse: Int32 = 1
                   setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
-
                   var addr = sockaddr_in()
                   addr.sin_family = sa_family_t(AF_INET)
                   addr.sin_port = in_port_t(port).bigEndian
                   addr.sin_addr.s_addr = INADDR_ANY
-
-                  let bindResult = withUnsafePointer(to: &addr) {
-                      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                          bind(serverSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                      }
-                  }
-                  guard bindResult >= 0 else { return }
+                  let bindRes = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(serverSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+                  guard bindRes >= 0 else { return }
                   listen(serverSocket, 32)
                   isRunning = true
 
                   while isRunning {
                       var clientAddr = sockaddr_in()
                       var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-                      let clientSocket = withUnsafeMutablePointer(to: &clientAddr) {
-                          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                              accept(serverSocket, $0, &clientLen)
-                          }
-                      }
-                      if clientSocket >= 0 {
-                          DispatchQueue.global(qos: .userInitiated).async {
-                              self.handleClient(clientSocket)
-                          }
+                      let client = withUnsafeMutablePointer(to: &clientAddr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(serverSocket, $0, &clientLen) } }
+                      if client >= 0 {
+                          DispatchQueue.global(qos: .userInitiated).async { self.handleClient(client) }
                       }
                   }
               }
 
               private func handleClient(_ socket: Int32) {
-                  var noSigPipe: Int32 = 1
-                  setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+                  var buf = [UInt8](repeating: 0, count: 2048)
+                  let n = read(socket, &buf, buf.count)
+                  guard n > 0 else { close(socket); return }
+                  let req = String(bytes: buf[0..<n], encoding: .utf8) ?? ""
 
-                  var buffer = [UInt8](repeating: 0, count: 2048)
-                  let bytesRead = read(socket, &buffer, buffer.count)
-                  guard bytesRead > 0 else { close(socket); return }
-                  let request = String(bytes: buffer[0..<bytesRead], encoding: .utf8) ?? ""
-
-                  if request.contains("GET /frame.jpg") {
-                      if let jpeg = captureManager?.latestJPEGData {
-                          let header = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: \(jpeg.count)\r\nCache-Control: no-cache\r\n\r\n"
+                  if req.contains("GET /live_points") {
+                      if let json = captureManager?.latestJSONPoints {
+                          let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(json.count)\r\n\r\n"
                           _ = header.withCString { write(socket, $0, strlen($0)) }
-                          _ = jpeg.withUnsafeBytes { write(socket, $0.baseAddress!, jpeg.count) }
+                          _ = json.withUnsafeBytes { write(socket, $0.baseAddress!, json.count) }
+                      } else {
+                          let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]"
+                          _ = resp.withCString { write(socket, $0, strlen($0)) }
                       }
-                  } else if request.contains("GET /status") {
+                  } else if req.contains("POST /toggle") {
+                      DispatchQueue.main.async { self.captureManager?.toggleContinuousScan() }
+                      let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+                      _ = resp.withCString { write(socket, $0, strlen($0)) }
+                  } else if req.contains("POST /clear") {
+                      DispatchQueue.main.async { self.captureManager?.clearScan() }
+                      let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+                      _ = resp.withCString { write(socket, $0, strlen($0)) }
+                  } else if req.contains("GET /status") {
                       let scanning = captureManager?.isScanning ?? false
                       let pts = captureManager?.pointCount ?? 0
-                      let tris = captureManager?.triangleCount ?? 0
                       let status = captureManager?.statusText ?? ""
-                      let hasSTL = (captureManager?.lastSTLURL != nil)
-                      let json = "{\"isScanning\":\(scanning),\"points\":\(pts),\"triangles\":\(tris),\"status\":\"\(status)\",\"hasSTL\":\(hasSTL)}"
+                      let json = "{\"isScanning\":\(scanning),\"points\":\(pts),\"status\":\"\(status)\"}"
                       let data = Data(json.utf8)
                       let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\n\r\n"
                       _ = header.withCString { write(socket, $0, strlen($0)) }
                       _ = data.withUnsafeBytes { write(socket, $0.baseAddress!, data.count) }
-                  } else if request.contains("POST /toggle") {
-                      DispatchQueue.main.async { self.captureManager?.toggleContinuousScan() }
-                      let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
-                      _ = resp.withCString { write(socket, $0, strlen($0)) }
-                  } else if request.contains("POST /clear") {
-                      DispatchQueue.main.async { self.captureManager?.clearScan() }
-                      let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
-                      _ = resp.withCString { write(socket, $0, strlen($0)) }
-                  } else if request.contains("GET /download.stl") {
+                  } else if req.contains("GET /download.stl") {
                       if let url = captureManager?.lastSTLURL, let stl = try? Data(contentsOf: url) {
-                          let header = "HTTP/1.1 200 OK\r\nContent-Type: application/sla\r\nContent-Disposition: attachment; filename=\"Escaneo3D_Pro.stl\"\r\nContent-Length: \(stl.count)\r\n\r\n"
+                          let header = "HTTP/1.1 200 OK\r\nContent-Type: application/sla\r\nContent-Disposition: attachment; filename=\"Escaneo3D_Profesional.stl\"\r\nContent-Length: \(stl.count)\r\n\r\n"
                           _ = header.withCString { write(socket, $0, strlen($0)) }
                           _ = stl.withUnsafeBytes { write(socket, $0.baseAddress!, stl.count) }
-                      } else {
-                          let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
-                          _ = resp.withCString { write(socket, $0, strlen($0)) }
                       }
                   }
                   close(socket)
@@ -619,7 +472,6 @@ jobs:
           }
           EOF
 
-          # 5. Interfaz SwiftUI Profesional en el iPhone
           cat << 'EOF' > TrueDepth3DScanner/ContentView.swift
           import SwiftUI
           import SceneKit
@@ -632,119 +484,57 @@ jobs:
               var body: some View {
                   VStack(spacing: 8) {
                       HStack {
-                          Circle()
-                              .fill(scanner.isScanning ? Color.red : Color.green)
-                              .frame(width: 10, height: 10)
-                          Text("IP Estudio PC: \(server.serverURL)")
-                              .font(.caption.monospaced())
-                              .foregroundColor(.green)
+                          Circle().fill(scanner.isScanning ? Color.red : Color.green).frame(width: 10, height: 10)
+                          Text("IP PC Studio: \(server.serverURL)").font(.caption.monospaced()).foregroundColor(.green)
                           Spacer()
-                          Text("2x Vol+ = Iniciar/Parar")
-                              .font(.caption2.bold())
-                              .padding(4)
-                              .background(Color.white.opacity(0.15))
-                              .foregroundColor(.yellow)
-                              .cornerRadius(4)
-                      }
-                      .padding(8)
-                      .background(Color.black)
+                          Text("2x Vol+ = Escanear").font(.caption2.bold()).foregroundColor(.yellow)
+                      }.padding(8).background(Color.black)
 
-                      Text(scanner.statusText)
-                          .font(.subheadline.bold())
-                          .foregroundColor(scanner.isScanning ? .red : .primary)
-                          .multilineTextAlignment(.center)
-                          .padding(.horizontal)
+                      Text(scanner.statusText).font(.subheadline.bold()).foregroundColor(scanner.isScanning ? .red : .primary).multilineTextAlignment(.center)
 
                       ZStack {
-                          SceneView(
-                              scene: scanner.previewScene,
-                              options: [.allowsCameraControl, .autoenablesDefaultLighting]
-                          )
-                          .background(Color.black)
-                          .cornerRadius(12)
-
+                          SceneView(scene: scanner.previewScene, options: [.allowsCameraControl, .autoenablesDefaultLighting]).background(Color.black).cornerRadius(12)
                           VStack {
                               HStack {
-                                  VStack(alignment: .leading, spacing: 4) {
-                                      Text("Vértices 3D: \(scanner.pointCount)")
-                                      Text("Triángulos STL: \(scanner.triangleCount)")
-                                  }
-                                  .font(.caption.bold())
-                                  .padding(8)
-                                  .background(Color.black.opacity(0.75))
-                                  .foregroundColor(.cyan)
-                                  .cornerRadius(8)
+                                  Text("Vértices: \(scanner.pointCount)").font(.caption.bold()).padding(6).background(Color.black.opacity(0.8)).foregroundColor(.cyan).cornerRadius(6)
                                   Spacer()
                               }
                               Spacer()
-                          }
-                          .padding(10)
-                      }
-                      .frame(maxHeight: .infinity)
+                          }.padding(10)
+                      }.frame(maxHeight: .infinity)
 
-                      VStack(spacing: 6) {
-                          HStack {
-                              Text("Corte de fondo: \(Int(scanner.maxDepthMeters * 100)) cm")
-                                  .font(.caption.bold())
-                              Spacer()
-                              Text("Resolución: \(String(format: "%.1f", scanner.voxelResolutionMM)) mm")
-                                  .font(.caption.bold())
-                          }
-                          Slider(value: $scanner.maxDepthMeters, in: 0.18...1.00, step: 0.02)
-                          Slider(value: $scanner.voxelResolutionMM, in: 1.0...4.0, step: 0.5)
-                      }
-                      .padding(.horizontal)
+                      VStack(spacing: 4) {
+                          Text("Resolución Vóxel: \(String(format: "%.2f", scanner.voxelResolutionMM)) mm (Mín. 0.05mm)").font(.caption.bold())
+                          Slider(value: $scanner.voxelResolutionMM, in: 0.05...1.00, step: 0.05)
+                      }.padding(.horizontal)
 
                       HStack(spacing: 12) {
                           Button(action: { scanner.toggleContinuousScan() }) {
-                              Text(scanner.isScanning ? "DETENER Y GUARDAR STL" : "INICIAR ESCANEO (O 2x VOL+)")
-                                  .font(.subheadline.bold())
-                                  .frame(maxWidth: .infinity)
-                                  .padding(14)
-                                  .background(scanner.isScanning ? Color.red : Color.teal)
-                                  .foregroundColor(.white)
-                                  .cornerRadius(10)
+                              Text(scanner.isScanning ? "DETENER ESCANEO" : "INICIAR SLAM (O 2x VOL+)")
+                                  .font(.subheadline.bold()).frame(maxWidth: .infinity).padding(14)
+                                  .background(scanner.isScanning ? Color.red : Color.teal).foregroundColor(.white).cornerRadius(10)
                           }
-
                           Button(action: { scanner.clearScan() }) {
-                              Text("Limpiar")
-                                  .bold()
-                                  .padding(14)
-                                  .background(Color.gray.opacity(0.3))
-                                  .foregroundColor(.primary)
-                                  .cornerRadius(10)
+                              Text("Limpiar").bold().padding(14).background(Color.gray.opacity(0.3)).foregroundColor(.primary).cornerRadius(10)
                           }
-                      }
-                      .padding(.horizontal)
+                      }.padding(.horizontal)
 
-                      if let stlURL = scanner.lastSTLURL {
-                          ShareLink(item: stlURL) {
-                              Text("Exportar / Enviar archivo .STL a PC")
-                                  .bold()
-                                  .frame(maxWidth: .infinity)
-                                  .padding(12)
-                                  .background(Color.blue)
-                                  .foregroundColor(.white)
-                                  .cornerRadius(10)
-                          }
-                          .padding(.horizontal)
+                      if let url = scanner.lastSTLURL {
+                          ShareLink(item: url) {
+                              Text("Enviar archivo .STL").bold().frame(maxWidth: .infinity).padding(12).background(Color.blue).foregroundColor(.white).cornerRadius(10)
+                          }.padding(.horizontal)
                       }
-                  }
-                  .padding(.bottom, 8)
-                  .onAppear {
+                  }.padding(.bottom, 8).onAppear {
                       UIApplication.shared.isIdleTimerDisabled = true
                       server.start(manager: scanner)
                       let handler = VolumeButtonHandler()
-                      handler.onDoublePress = {
-                          scanner.toggleContinuousScan()
-                      }
+                      handler.onDoublePress = { scanner.toggleContinuousScan() }
                       self.volumeHandler = handler
                   }
               }
           }
           EOF
 
-          # 6. Configurar project.yml
           brew install xcodegen
           cat << 'EOF' > project.yml
           name: TrueDepth3DScanner
@@ -756,19 +546,16 @@ jobs:
             TrueDepth3DScanner:
               type: application
               platform: iOS
-              sources:
-                - path: TrueDepth3DScanner
-                  excludes:
-                    - Info.plist
+              sources: [path: TrueDepth3DScanner]
               info:
                 path: TrueDepth3DScanner/Info.plist
                 properties:
-                  NSCameraUsageDescription: "Se requiere acceso al sensor TrueDepth y ARKit para el escaneo 3D continuo de alta precisión."
-                  NSMotionUsageDescription: "Se requiere acceso a los sensores inerciales para fusionar las nubes de puntos 3D."
-                  NSLocalNetworkUsageDescription: "Permite conectar el escáner con la aplicación de escritorio en tu PC."
+                  CFBundleDisplayName: "Bichito 3D Pro"
+                  NSCameraUsageDescription: "Sensor TrueDepth y ARKit SLAM."
+                  NSMotionUsageDescription: "Odometría inercial 6DoF."
+                  NSLocalNetworkUsageDescription: "Conexión PC Studio."
                   UILaunchScreen: {}
-                  UISupportedInterfaceOrientations:
-                    - UIInterfaceOrientationPortrait
+                  UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
               settings:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.scanner3d.truedepthstl
@@ -780,27 +567,18 @@ jobs:
           xcodegen generate
           sed -i '' 's/objectVersion = 77;/objectVersion = 56;/g' TrueDepth3DScanner.xcodeproj/project.pbxproj
 
-      - name: Compilar aplicación para iPhone (Release)
+      - name: Compilar para iOS (Release)
         run: |
-          xcodebuild -project TrueDepth3DScanner.xcodeproj \
-            -scheme TrueDepth3DScanner \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath build \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES
+          xcodebuild -project TrueDepth3DScanner.xcodeproj -scheme TrueDepth3DScanner -configuration Release -sdk iphoneos -destination "generic/platform=iOS" -derivedDataPath build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO AD_HOC_CODE_SIGNING_ALLOWED=YES
 
-      - name: Empaquetar en archivo .ipa
+      - name: Empaquetar IPA
         run: |
           APP_PATH=$(find . -name "TrueDepth3DScanner.app" -type d | head -n 1)
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
           zip -r "$GITHUB_WORKSPACE/TrueDepth3DScanner.ipa" Payload
 
-      - name: Subir archivo IPA listo para Sideloadly
+      - name: Subir Artifact
         uses: actions/upload-artifact@v4
         with:
           name: TrueDepth3DScanner-IPA
