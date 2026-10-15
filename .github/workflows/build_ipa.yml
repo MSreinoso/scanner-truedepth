@@ -12,27 +12,74 @@ jobs:
       - name: Descargar código del repositorio
         uses: actions/checkout@v4
 
-      - name: Generar proyecto Xcode con XcodeGen
+      - name: Preparar y generar proyecto para Xcode 15.4
         run: |
           brew install xcodegen
+          PROJECT_FILE=$(find . -name "project.yml" | head -n 1)
+          cd "$(dirname "$PROJECT_FILE")"
+
+          # Asegurar import Combine en los módulos que usan @Published
+          for f in TrueDepth3DScanner/DepthCaptureManager.swift TrueDepth3DScanner/WebStreamServer.swift; do
+            if [ -f "$f" ] && ! grep -q "import Combine" "$f"; then
+              printf "import Combine\n" | cat - "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            fi
+          done
+
+          # Ajustar project.yml para evitar duplicados de Info.plist
+          cat << 'EOF' > project.yml
+          name: TrueDepth3DScanner
+          options:
+            bundleIdPrefix: com.scanner3d
+            deploymentTarget:
+              iOS: "16.0"
+          targets:
+            TrueDepth3DScanner:
+              type: application
+              platform: iOS
+              sources:
+                - path: TrueDepth3DScanner
+                  excludes:
+                    - Info.plist
+              info:
+                path: TrueDepth3DScanner/Info.plist
+                properties:
+                  NSCameraUsageDescription: "Se requiere acceso a la cámara TrueDepth (Face ID) para capturar el mapa de profundidad y reconstruir la geometría 3D."
+                  NSLocalNetworkUsageDescription: "Se utiliza la red Wi-Fi local para transmitir la vista del escáner 3D en tiempo real hacia el navegador de tu PC."
+                  UILaunchScreen: {}
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.scanner3d.truedepthstl
+                  CODE_SIGN_IDENTITY: ""
+                  CODE_SIGNING_REQUIRED: NO
+                  CODE_SIGNING_ALLOWED: NO
+          EOF
+
           xcodegen generate
+          sed -i '' 's/objectVersion = 77;/objectVersion = 56;/g' TrueDepth3DScanner.xcodeproj/project.pbxproj
 
       - name: Compilar aplicación para iPhone (Release)
         run: |
+          PROJECT_DIR=$(dirname "$(find . -name "TrueDepth3DScanner.xcodeproj" | head -n 1)")
+          cd "$PROJECT_DIR"
           xcodebuild -project TrueDepth3DScanner.xcodeproj \
             -scheme TrueDepth3DScanner \
             -configuration Release \
             -sdk iphoneos \
+            -destination "generic/platform=iOS" \
             -derivedDataPath build \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
 
       - name: Empaquetar en archivo .ipa
         run: |
+          APP_PATH=$(find . -name "TrueDepth3DScanner.app" -type d | head -n 1)
           mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/TrueDepth3DScanner.app Payload/
-          zip -r TrueDepth3DScanner.ipa Payload
+          cp -r "$APP_PATH" Payload/
+          zip -r "$GITHUB_WORKSPACE/TrueDepth3DScanner.ipa" Payload
 
       - name: Subir archivo IPA listo para Sideloadly
         uses: actions/upload-artifact@v4
