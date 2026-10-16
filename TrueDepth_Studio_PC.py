@@ -39,9 +39,18 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 class TrueDepthStudioApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("TrueDepth 3D Studio - Grado Industrial")
+        self.root.title("Bichito 3D Pro - Studio PC")
         self.root.geometry("1300x820")
         self.root.configure(bg="#0b0f19")
+        
+        # Cargar icono de la aplicación
+        icon_path = os.path.join(os.path.dirname(__file__), "bichito_pro_icon_1024.png")
+        if os.path.exists(icon_path):
+            try:
+                self.app_icon = ImageTk.PhotoImage(Image.open(icon_path).resize((64, 64)))
+                self.root.iconphoto(False, self.app_icon)
+            except Exception:
+                pass
         
         # Estado de red
         self.iphone_ip = None
