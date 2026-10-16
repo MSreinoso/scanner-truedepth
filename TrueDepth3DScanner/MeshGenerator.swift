@@ -142,10 +142,10 @@ class MeshGenerator {
                         let pixelOffset = colorY * colorBytesPerRow + colorX * 4
                         let bytePtr = base.advanced(by: pixelOffset).assumingMemoryBound(to: UInt8.self)
                         // kCVPixelFormatType_32BGRA
-                        let b = bytePtr[0]
-                        let g = bytePtr[1]
-                        let r = bytePtr[2]
-                        gridColors[r][c] = SIMD3<UInt8>(r, g, b)
+                        let blue = bytePtr[0]
+                        let green = bytePtr[1]
+                        let red = bytePtr[2]
+                        gridColors[r][c] = SIMD3<UInt8>(red, green, blue)
                     }
                 }
             }
