@@ -56,6 +56,11 @@ struct ContentView: View {
                 .padding(.vertical, 8)
                 .background(Color.black.opacity(0.92))
                 .foregroundColor(.white)
+
+                ConnectionPanel(client: captureManager.streamClient, phoneURL: webServer.serverURL)
+                Text(captureManager.statusMessage)
+                    .font(.caption2)
+                    .padding(.horizontal)
                 
                 // Viewport Mode Switcher
                 Picker("Modo", selection: $showPreviewMode) {
@@ -289,13 +294,23 @@ struct ContentView: View {
     }
     
     private func setupNetworking() {
+        webServer.onConnectToPC = { captureManager.streamClient.connect(to: $0) }
         webServer.getLatestJPEG = { captureManager.latestJPEGData }
         webServer.getLatestSTL = { captureManager.latestSTLData }
         webServer.getLatestPLY = { captureManager.latestPLYData }
         webServer.getLatestNewPoints = { captureManager.latestNewPointsJSON }
         webServer.getStatusJSON = {
-            let status = captureManager.statusMessage.replacingOccurrences(of: "\"", with: "'")
-            return "{\"isScanning\": \(captureManager.isScanning), \"points\": \(captureManager.pointCount), \"triangles\": \(captureManager.triangleCount), \"status\": \"\(status)\"}"
+            DispatchQueue.main.sync {
+                let status: [String: Any] = [
+                    "isScanning": captureManager.isScanning,
+                    "points": captureManager.pointCount,
+                    "triangles": captureManager.triangleCount,
+                    "status": captureManager.statusMessage
+                ]
+                guard let data = try? JSONSerialization.data(withJSONObject: status),
+                      let json = String(data: data, encoding: .utf8) else { return "{}" }
+                return json
+            }
         }
         webServer.onToggleScan = {
             captureManager.toggleScan()
@@ -309,6 +324,33 @@ struct ContentView: View {
                 self.showShareSheet = true
             }
         }
+    }
+}
+
+private struct ConnectionPanel: View {
+    @ObservedObject var client: BinaryStreamClient
+    let phoneURL: String
+    @AppStorage("manualPCAddress") private var pcIP = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("iPhone/iPad: \(phoneURL)")
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+            Text("TCP: \(client.connectionState) • \(client.framesStreamed) frames")
+                .font(.caption2)
+                .foregroundColor(client.isConnected ? .green : .orange)
+            HStack {
+                TextField("IP de Windows (ej. 192.168.1.10)", text: $pcIP)
+                    .keyboardType(.decimalPad)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                Button("Conectar PC") { client.connect(to: pcIP) }
+                    .disabled(pcIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 6)
     }
 }
 

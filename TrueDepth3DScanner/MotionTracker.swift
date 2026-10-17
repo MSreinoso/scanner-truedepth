@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import CoreMotion
 import simd
 
@@ -6,6 +7,7 @@ import simd
 /// Uses Apple's CoreMotion sensor fusion (IMU Gyroscope + Accelerometer) at 60 Hz
 /// to anchor scanned 3D points rigidly in world space as the user moves around the object.
 class MotionTracker: ObservableObject {
+    private let stateLock = NSLock()
     private let motionManager = CMMotionManager()
     private let queue = OperationQueue()
     
@@ -19,7 +21,12 @@ class MotionTracker: ObservableObject {
     private var lastTimestamp: TimeInterval = 0
     private var initialAttitudeMatrix: simd_float3x3?
     // Most recent raw CMDeviceMotion snapshot for frame synchronization
-    private(set) var latestDeviceMotion: CMDeviceMotion?
+    private var deviceMotion: CMDeviceMotion?
+    var latestDeviceMotion: CMDeviceMotion? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return deviceMotion
+    }
     
     init() {
         queue.name = "com.truedepth.motionTracker"
@@ -49,17 +56,22 @@ class MotionTracker: ObservableObject {
     
     func resetAnchor() {
         queue.addOperation { [weak self] in
-            self?.initialAttitudeMatrix = nil
-            self?.currentTranslation = SIMD3<Float>(0, 0, 0)
-            self?.velocity = SIMD3<Float>(0, 0, 0)
-            self?.currentWorldTransform = matrix_identity_float4x4
-            self?.currentRotation = matrix_identity_float3x3
-            self?.lastTimestamp = 0
+            guard let self = self else { return }
+            self.stateLock.lock()
+            defer { self.stateLock.unlock() }
+            self.initialAttitudeMatrix = nil
+            self.currentTranslation = SIMD3<Float>(0, 0, 0)
+            self.velocity = SIMD3<Float>(0, 0, 0)
+            self.currentWorldTransform = matrix_identity_float4x4
+            self.currentRotation = matrix_identity_float3x3
+            self.lastTimestamp = 0
         }
     }
     
     private func processMotion(_ motion: CMDeviceMotion) {
-        self.latestDeviceMotion = motion
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        self.deviceMotion = motion
         let attitude = motion.attitude
         let rotMat = attitude.rotationMatrix
         
@@ -110,6 +122,8 @@ class MotionTracker: ObservableObject {
     /// Hardware convention: +X Right, +Y Up, +Z Forward.
     /// Output convention for CAD / OpenGL: +X Right, +Y Up, -Z Forward.
     func transformPointToWorld(xM: Float, yM: Float, z: Float) -> SIMD3<Float> {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         let pDev = SIMD3<Float>(xM, -yM, z)
         let pWorld = simd_mul(currentRotation, pDev) + currentTranslation
         return SIMD3<Float>(pWorld.x, pWorld.y, -pWorld.z)

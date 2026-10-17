@@ -1,16 +1,15 @@
 import Foundation
+import Combine
 import Network
 import UIKit
 
-/// High-throughput HTTP & UDP server running natively on iOS.
+/// HTTP preview, exports and manual TCP pairing running natively on iOS.
 /// Handles real-time video streaming, continuous 3D telemetry, CAD STL/PLY model downloads,
-/// and automated UDP beaconing (port 50505) for zero-config PC pairing.
+/// and a /connect endpoint that pairs with the requesting PC.
 class WebStreamServer: ObservableObject {
     @Published var serverURL: String = "Obteniendo IP Wi-Fi..."
     private var listener: NWListener?
     private let port: UInt16 = 8080
-    private let udpBeaconPort: UInt16 = 50505
-    private var udpTimer: Timer?
     
     var getLatestJPEG: (() -> Data?)?
     var getLatestSTL: (() -> Data?)?
@@ -18,10 +17,12 @@ class WebStreamServer: ObservableObject {
     var getLatestNewPoints: (() -> Data?)?
     var getStatusJSON: (() -> String)?
     var onToggleScan: (() -> Void)?
+    var onConnectToPC: ((String) -> Void)?
     var onClearScan: (() -> Void)?
     var onTriggerShareOnPhone: (() -> Void)?
     
     func start() {
+        guard listener == nil else { return }
         do {
             let parameters = NWParameters.tcp
             listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
@@ -35,34 +36,12 @@ class WebStreamServer: ObservableObject {
             DispatchQueue.main.async {
                 if let ip = self.getWiFiAddress() {
                     self.serverURL = "http://\(ip):\(self.port)"
-                    self.startUDPBeacon(ip: ip)
                 } else {
                     self.serverURL = "Conecta el iPhone a la misma red Wi-Fi"
                 }
             }
         } catch {
             print("Error iniciando servidor WebStreamServer: \(error)")
-        }
-    }
-    
-    // MARK: - UDP Auto-Discovery Beacon (Port 50505)
-    private func startUDPBeacon(ip: String) {
-        udpTimer?.invalidate()
-        
-        udpTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            let status = self.getStatusJSON?() ?? "READY"
-            let beaconMessage = "TRUEDEPTH_3D_BEACON|IP:\(ip)|PORT:\(self.port)|\(status)"
-            guard let beaconData = beaconMessage.data(using: .utf8) else { return }
-            
-            let host = NWEndpoint.Host("255.255.255.255")
-            let beaconPort = NWEndpoint.Port(rawValue: self.udpBeaconPort)!
-            let connection = NWConnection(host: host, port: beaconPort, using: .udp)
-            
-            connection.start(queue: .global(qos: .background))
-            connection.send(content: beaconData, completion: .contentProcessed { _ in
-                connection.cancel()
-            })
         }
     }
     
@@ -81,7 +60,16 @@ class WebStreamServer: ObservableObject {
             let parts = firstLine.components(separatedBy: " ")
             let path = parts.count > 1 ? parts[1] : "/"
             
-            if path.hasPrefix("/frame.jpg") {
+            if path == "/connect" {
+                guard case let .hostPort(host, _) = connection.endpoint else {
+                    connection.cancel()
+                    return
+                }
+                self.onConnectToPC?("\(host)")
+                self.sendResponse(connection: connection, status: "202 Accepted",
+                                  contentType: "application/json",
+                                  body: Data("{\"status\":\"connecting\"}".utf8))
+            } else if path.hasPrefix("/frame.jpg") {
                 if let jpeg = self.getLatestJPEG?() {
                     self.sendResponse(connection: connection, contentType: "image/jpeg", body: jpeg)
                 } else {
@@ -161,7 +149,8 @@ class WebStreamServer: ObservableObject {
             while ptr != nil {
                 defer { ptr = ptr?.pointee.ifa_next }
                 guard let interface = ptr?.pointee else { continue }
-                let addrFamily = interface.ifa_addr.pointee.sa_family
+                guard let addr = interface.ifa_addr else { continue }
+                let addrFamily = addr.pointee.sa_family
                 if addrFamily == UInt8(AF_INET) {
                     let name = String(cString: interface.ifa_name)
                     if name == "en0" || name == "bridge100" {
