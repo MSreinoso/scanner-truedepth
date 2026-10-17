@@ -80,8 +80,16 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private var frameCounter: Int = 0
     
+    // 6DoF Inertial Motion Tracker (60 Hz IMU fusion for spatial anchoring)
+    let motionTracker = MotionTracker()
+    
+    // Persistent TCP Binary Streaming Client (EinStar architecture)
+    let streamClient = BinaryStreamClient()
+    private var streamFrameID: UInt32 = 0
+    
     override init() {
         super.init()
+        streamClient.startDiscovery()
         checkPermissionsAndConfigure()
     }
     
@@ -123,12 +131,25 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
             if captureSession.canAddInput(input) {
                 captureSession.addInput(input)
             }
+            
+            // Frame rate configuration: lock to 60 FPS for high-rate continuous stream
+            try device.lockForConfiguration()
+            for range in device.activeFormat.videoSupportedFrameRateRanges {
+                if range.maxFrameRate >= 59.0 {
+                    device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 60)
+                    device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 60)
+                    break
+                } else if range.maxFrameRate >= 29.0 {
+                    let rate = min(60.0, range.maxFrameRate)
+                    device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
+                    device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
+                }
+            }
+            device.unlockForConfiguration()
         } catch {
             DispatchQueue.main.async {
-                self.statusMessage = "Error al conectar sensor: \(error.localizedDescription)"
+                self.statusMessage = "Configuración sensor: \(error.localizedDescription)"
             }
-            captureSession.commitConfiguration()
-            return
         }
         
         if captureSession.canAddOutput(videoDataOutput) {
@@ -140,7 +161,8 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
         }
         
         if captureSession.canAddOutput(depthDataOutput) {
-            depthDataOutput.isFilteringEnabled = true
+            // Output raw, non-smoothed millimetric depth data (EinStar architecture)
+            depthDataOutput.isFilteringEnabled = false
             captureSession.addOutput(depthDataOutput)
             if let connection = depthDataOutput.connection(with: .depthData) {
                 connection.isEnabled = true
@@ -173,11 +195,16 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
         let generator = UINotificationFeedbackGenerator()
         generator.notificationOccurred(.success)
         
+        // Lock 6DoF spatial anchor to current camera origin and start 60 Hz inertial tracking
+        motionTracker.resetAnchor()
+        motionTracker.startTracking()
+        streamFrameID = 0
+        
         processingQueue.async { [weak self] in
             guard let self = self else { return }
             DispatchQueue.main.async {
                 self.isScanning = true
-                self.statusMessage = "GRABANDO ESCANEO 3D CONTINUO..."
+                self.statusMessage = "GRABANDO ESCANEO 3D CONTINUO (60 FPS)..."
             }
         }
     }
@@ -185,6 +212,9 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
     func stopScan() {
         let generator = UINotificationFeedbackGenerator()
         generator.notificationOccurred(.warning)
+        
+        // Stop motion sensor updates
+        motionTracker.stopTracking()
         
         processingQueue.async { [weak self] in
             guard let self = self else { return }
@@ -215,6 +245,7 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
     }
     
     func clearScan() {
+        motionTracker.resetAnchor()
         processingQueue.async { [weak self] in
             guard let self = self else { return }
             self.voxelSet.removeAll()
@@ -280,8 +311,23 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
                 }
             }
             
-            // If actively scanning, integrate this frame into the continuous 3D voxel grid
+            // State B: Active Video Scan -> Stream synchronized raw 30 FPS frames to PC
             if self.isScanning {
+                let timestamp = CMSampleBufferGetPresentationTimeStamp(synchVideoData.sampleBuffer).seconds
+                let motion = self.motionTracker.latestDeviceMotion
+                
+                if let packet = FrameSerializer.serialize(
+                    frameID: self.streamFrameID,
+                    timestamp: timestamp,
+                    depthData: depthData,
+                    colorPixelBuffer: pixelBuffer,
+                    deviceMotion: motion
+                ) {
+                    self.streamClient.sendFrame(packet)
+                    self.streamFrameID += 1
+                }
+                
+                // Also integrate locally for device preview
                 self.integrateDepthFrame(depthData: depthData, colorBuffer: self.latestColorPixelBuffer)
             }
         }
@@ -331,7 +377,7 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
             cy = intrinsicMatrix.columns.2.y * scaleY
         }
         
-        let step = 2
+        let step = (depthWidth > 400) ? 2 : 1
         let gridCols = depthWidth / step
         let gridRows = depthHeight / step
         let voxelSize = self.voxelSizeMeters
@@ -350,16 +396,12 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
             
             for c in 0..<gridCols {
                 let xPixel = c * step
-                let z = depthFloatBuffer[rowOffset + xPixel]
+                let rawZ = depthFloatBuffer[rowOffset + xPixel]
                 
-                if z.isNaN || z.isInfinite || z < minD || z > maxD { continue }
-                if let planeLimit = self.basePlaneCutoffZ, z >= planeLimit { continue }
+                if rawZ.isNaN || rawZ.isInfinite || rawZ < minD || rawZ > maxD { continue }
+                if let planeLimit = self.basePlaneCutoffZ, rawZ >= planeLimit { continue }
                 
-                let xM = (Float(xPixel) - cx) * z / fx
-                let yM = (Float(yPixel) - cy) * z / fy
-                let pt = SIMD3<Float>(xM, -yM, -z)
-                
-                // Sample Color
+                // Sample Color at (xPixel, yPixel) from video frame
                 var vertexColor = SIMD3<UInt8>(180, 180, 180)
                 if let base = colorBaseAddress, colorWidth > 0, colorHeight > 0 {
                     let cX = Int((Float(xPixel) / Float(depthWidth)) * Float(colorWidth))
@@ -367,11 +409,57 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
                     if cX >= 0 && cX < colorWidth && cY >= 0 && cY < colorHeight {
                         let offset = cY * colorBytesPerRow + cX * 4
                         let bPtr = base.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
-                        vertexColor = SIMD3<UInt8>(bPtr[2], bPtr[1], bPtr[0])
+                        let byteB = bPtr[0], byteG = bPtr[1], byteR = bPtr[2]
+                        vertexColor = SIMD3<UInt8>(byteR, byteG, byteB)
                     }
                 }
                 
-                // Spatial Voxel Hash Key
+                // Bilateral Edge-Preserving Depth Smoothing & Anti-Spike Filter
+                var smoothedZ = rawZ
+                if c > 0 && c < gridCols - 1 && r > 0 && r < gridRows - 1 {
+                    let zL = depthFloatBuffer[rowOffset + (c - 1) * step]
+                    let zR = depthFloatBuffer[rowOffset + (c + 1) * step]
+                    let zU = depthFloatBuffer[(r - 1) * step * depthWidth + xPixel]
+                    let zD = depthFloatBuffer[(r + 1) * step * depthWidth + xPixel]
+                    
+                    let validL = !zL.isNaN && zL >= minD && zL <= maxD
+                    let validR = !zR.isNaN && zR >= minD && zR <= maxD
+                    let validU = !zU.isNaN && zU >= minD && zU <= maxD
+                    let validD = !zD.isNaN && zD >= minD && zD <= maxD
+                    
+                    // Spike rejection: isolate and suppress spurious IR reflection peaks
+                    var isSpike = false
+                    if validL && validR && abs(zL - zR) < 0.008 && abs(rawZ - (zL + zR) * 0.5) > 0.012 {
+                        smoothedZ = (zL + zR) * 0.5
+                        isSpike = true
+                    } else if validU && validD && abs(zU - zD) < 0.008 && abs(rawZ - (zU + zD) * 0.5) > 0.012 {
+                        smoothedZ = (zU + zD) * 0.5
+                        isSpike = true
+                    }
+                    
+                    // Guided bilateral smoothing across contiguous surface patches
+                    if !isSpike {
+                        var sumZ: Float = rawZ * 2.0
+                        var sumW: Float = 2.0
+                        let neighbors = [(validL, zL), (validR, zR), (validU, zU), (validD, zD)]
+                        for (valid, nZ) in neighbors {
+                            if valid && abs(rawZ - nZ) < 0.015 {
+                                sumZ += nZ
+                                sumW += 1.0
+                            }
+                        }
+                        smoothedZ = sumZ / sumW
+                    }
+                }
+                
+                let xM = (Float(xPixel) - cx) * smoothedZ / fx
+                let yM = (Float(yPixel) - cy) * smoothedZ / fy
+                
+                // Rigid 6DoF World Anchor Transformation:
+                // Anchors the 3D model statically in world coordinates as the camera moves around it
+                let pt = self.motionTracker.transformPointToWorld(xM: xM, yM: yM, z: smoothedZ)
+                
+                // Spatial Voxel Hash Key (in world meters)
                 let vKey = VoxelKey(
                     x: Int32(floor(pt.x / voxelSize)),
                     y: Int32(floor(pt.y / voxelSize)),

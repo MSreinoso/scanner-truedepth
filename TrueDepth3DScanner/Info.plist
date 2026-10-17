@@ -38,6 +38,8 @@
     <string>Se requiere acceso a la cámara TrueDepth (Face ID) para capturar el mapa de profundidad y reconstruir la geometría 3D.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Se utiliza la red Wi-Fi local para transmitir la vista del escáner 3D en tiempo real hacia el navegador de tu PC.</string>
+    <key>NSMotionUsageDescription</key>
+    <string>Se requiere acceso a los sensores de movimiento para estabilizar y anclar la nube de puntos 3D en el espacio real.</string>
     <key>UILaunchScreen</key>
     <dict/>
     <key>UISupportedInterfaceOrientations</key>

@@ -37,20 +37,20 @@ struct ContentView: View {
                 // Telemetry Header
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(captureManager.isScanning ? Color.red : (captureManager.isSessionRunning ? Color.green : Color.gray))
+                        .fill(captureManager.isScanning ? Color.red : (captureManager.streamClient.isConnected ? Color.green : Color.orange))
                         .frame(width: 10, height: 10)
                         .scaleEffect(captureManager.isScanning ? 1.25 : 1.0)
                         .animation(captureManager.isScanning ? Animation.easeInOut(duration: 0.6).repeatForever() : .default, value: captureManager.isScanning)
                     
-                    Text(captureManager.isScanning ? "GRABANDO ESCANEO 3D" : "PC Studio: \(webServer.serverURL)")
+                    Text(captureManager.isScanning ? "STREAMING 3D (\(captureManager.streamClient.framesStreamed) f)" : "TCP: \(captureManager.streamClient.connectionState)")
                         .font(.caption.monospaced().bold())
-                        .foregroundColor(captureManager.isScanning ? .red : .white)
+                        .foregroundColor(captureManager.isScanning ? .red : (captureManager.streamClient.isConnected ? .green : .white))
                     
                     Spacer()
                     
-                    Text("Auto UDP: 50505")
+                    Text("EinStar v2.0 • 50506")
                         .font(.caption2.monospaced())
-                        .foregroundColor(.gray)
+                        .foregroundColor(.cyan)
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 8)
