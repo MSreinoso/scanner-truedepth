@@ -98,7 +98,10 @@ class MotionTracker: ObservableObject {
         currentTranslation += velocity * dt
         
         // Build 4x4 Rigid Homogeneous Transformation Matrix [R | t]
-        var T = simd_float4x4(R_anchor)
+        var T = matrix_identity_float4x4
+        T.columns.0 = SIMD4<Float>(R_anchor.columns.0.x, R_anchor.columns.0.y, R_anchor.columns.0.z, 0.0)
+        T.columns.1 = SIMD4<Float>(R_anchor.columns.1.x, R_anchor.columns.1.y, R_anchor.columns.1.z, 0.0)
+        T.columns.2 = SIMD4<Float>(R_anchor.columns.2.x, R_anchor.columns.2.y, R_anchor.columns.2.z, 0.0)
         T.columns.3 = SIMD4<Float>(currentTranslation.x, currentTranslation.y, currentTranslation.z, 1.0)
         self.currentWorldTransform = T
     }

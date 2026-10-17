@@ -297,18 +297,19 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
             let depthData = synchDepthData.depthData
             
             // Extract synchronized Video Buffer
-            if let synchVideoData = synchronizedDataCollection.synchronizedData(for: self.videoDataOutput) as? AVCaptureSynchronizedSampleBufferData,
-               !synchVideoData.sampleBufferWasDropped,
-               let pixelBuffer = CMSampleBufferGetImageBuffer(synchVideoData.sampleBuffer) {
-                
-                self.latestColorPixelBuffer = pixelBuffer
-                
-                // Generate streaming JPEG for live preview
-                let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
-                if let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) {
-                    let uiImage = UIImage(cgImage: cgImage)
-                    self.latestJPEGData = uiImage.jpegData(compressionQuality: 0.5)
-                }
+            guard let synchVideoData = synchronizedDataCollection.synchronizedData(for: self.videoDataOutput) as? AVCaptureSynchronizedSampleBufferData,
+                  !synchVideoData.sampleBufferWasDropped,
+                  let pixelBuffer = CMSampleBufferGetImageBuffer(synchVideoData.sampleBuffer) else {
+                return
+            }
+            
+            self.latestColorPixelBuffer = pixelBuffer
+            
+            // Generate streaming JPEG for live preview
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
+            if let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) {
+                let uiImage = UIImage(cgImage: cgImage)
+                self.latestJPEGData = uiImage.jpegData(compressionQuality: 0.5)
             }
             
             // State B: Active Video Scan -> Stream synchronized raw 30 FPS frames to PC
