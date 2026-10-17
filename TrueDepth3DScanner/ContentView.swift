@@ -26,48 +26,41 @@ struct ContentView: View {
     @StateObject private var webServer = WebStreamServer()
     @StateObject private var volumeTrigger = VolumeButtonTriggerManager()
     
-    @State private var capturedMesh: Mesh3D?
-    @State private var exportedSTLURL: URL?
-    @State private var exportedPLYURL: URL?
-    @State private var latestSTLData: Data?
-    @State private var latestPLYData: Data?
-    
-    @State private var showShareSheet = false
-    @State private var isProcessing = false
     @State private var showPreviewMode = false
     @State private var showWireframe = false
-    @State private var enableSORFilter = true
-    @State private var errorMessage: String?
-    
-    @State private var minDistance: Float = 0.15
-    @State private var maxDistance: Float = 0.50
-    @State private var basePlaneCutoff: Float = 0.0 // 0 = disabled
-    @State private var meshResolution: Int = 2
+    @State private var showShareSheet = false
+    @State private var shareURL: URL?
     
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
                 // Telemetry Header
-                HStack {
+                HStack(spacing: 8) {
                     Circle()
-                        .fill(captureManager.isSessionRunning ? Color.green : Color.red)
-                        .frame(width: 8, height: 8)
-                    Text("PC Studio: \(webServer.serverURL)")
+                        .fill(captureManager.isScanning ? Color.red : (captureManager.isSessionRunning ? Color.green : Color.gray))
+                        .frame(width: 10, height: 10)
+                        .scaleEffect(captureManager.isScanning ? 1.25 : 1.0)
+                        .animation(captureManager.isScanning ? Animation.easeInOut(duration: 0.6).repeatForever() : .default, value: captureManager.isScanning)
+                    
+                    Text(captureManager.isScanning ? "GRABANDO ESCANEO 3D" : "PC Studio: \(webServer.serverURL)")
                         .font(.caption.monospaced().bold())
+                        .foregroundColor(captureManager.isScanning ? .red : .white)
+                    
                     Spacer()
+                    
                     Text("Auto UDP: 50505")
                         .font(.caption2.monospaced())
                         .foregroundColor(.gray)
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 8)
-                .background(Color.black.opacity(0.90))
+                .background(Color.black.opacity(0.92))
                 .foregroundColor(.white)
                 
-                // Mode Selector
+                // Viewport Mode Switcher
                 Picker("Modo", selection: $showPreviewMode) {
                     Text("1. Vista Cámara").tag(false)
-                    Text("2. Malla CAD 3D").tag(true)
+                    Text("2. Malla 3D Final").tag(true)
                 }
                 .pickerStyle(SegmentedPickerStyle())
                 .padding(.horizontal)
@@ -82,16 +75,52 @@ struct ContentView: View {
                         
                         // Reticle Overlay
                         RoundedRectangle(cornerRadius: 24)
-                            .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [10]))
-                            .foregroundColor(.cyan.opacity(0.85))
-                            .padding(40)
+                            .strokeBorder(
+                                style: StrokeStyle(lineWidth: captureManager.isScanning ? 3 : 2, dash: captureManager.isScanning ? [] : [10])
+                            )
+                            .foregroundColor(captureManager.isScanning ? .red : .cyan.opacity(0.85))
+                            .padding(36)
                         
+                        // Top Scanning Stats HUD
                         VStack {
+                            if captureManager.isScanning || captureManager.pointCount > 0 {
+                                HStack(spacing: 16) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("VÉRTICES ACUMULADOS")
+                                            .font(.system(size: 9, weight: .bold))
+                                            .foregroundColor(.gray)
+                                        Text("\(captureManager.pointCount.formatted())")
+                                            .font(.system(size: 20, weight: .heavy, design: .monospaced))
+                                            .foregroundColor(.cyan)
+                                    }
+                                    
+                                    Divider()
+                                        .frame(height: 24)
+                                        .background(Color.white.opacity(0.3))
+                                    
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("FACETAS CAD")
+                                            .font(.system(size: 9, weight: .bold))
+                                            .foregroundColor(.gray)
+                                        Text("\(captureManager.triangleCount.formatted())")
+                                            .font(.system(size: 20, weight: .heavy, design: .monospaced))
+                                            .foregroundColor(.green)
+                                    }
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(14)
+                                .padding(.top, 14)
+                            }
+                            
                             Spacer()
+                            
+                            // Bottom Guidance Badge
                             HStack(spacing: 8) {
                                 Image(systemName: "speaker.wave.3.fill")
                                     .foregroundColor(.yellow)
-                                Text("Doble clic en Botón de Volumen para Disparar")
+                                Text("Doble clic en Botón de Volumen para \(captureManager.isScanning ? "DETENER" : "INICIAR") Escaneo")
                                     .font(.caption.bold())
                             }
                             .padding(.horizontal, 14)
@@ -101,13 +130,13 @@ struct ContentView: View {
                             .padding(.bottom, 16)
                         }
                     } else {
-                        SceneKit3DView(mesh: capturedMesh, showWireframe: showWireframe)
+                        SceneKit3DView(mesh: captureManager.latestMesh, showWireframe: showWireframe)
                             .edgesIgnoringSafeArea(.horizontal)
                         
-                        if let mesh = capturedMesh {
+                        if let mesh = captureManager.latestMesh {
                             VStack {
                                 HStack {
-                                    Label("\(mesh.triangles.count) facetas", systemImage: "shippingbox.fill")
+                                    Label("\(mesh.triangles.count) triángulos", systemImage: "cube.fill")
                                         .font(.caption.bold())
                                         .padding(8)
                                         .background(.ultraThinMaterial)
@@ -140,7 +169,7 @@ struct ContentView: View {
                                 Image(systemName: "cube.transparent")
                                     .font(.system(size: 56))
                                     .foregroundColor(.gray)
-                                Text("Sin escaneo activo.\nPresiona el botón de abajo o doble clic en Subir Volumen.")
+                                Text("Aún no has completado un escaneo.\nInicia el escaneo continuo y rodéalo con la cámara.")
                                     .font(.subheadline)
                                     .foregroundColor(.gray)
                                     .multilineTextAlignment(.center)
@@ -148,86 +177,87 @@ struct ContentView: View {
                             }
                         }
                     }
-                    
-                    if isProcessing {
-                        VStack(spacing: 14) {
-                            ProgressView()
-                                .scaleEffect(1.4)
-                            Text("Filtrado SOR & Reconstrucción...")
-                                .font(.subheadline.bold())
-                        }
-                        .padding(26)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(18)
-                    }
                 }
                 .frame(maxHeight: .infinity)
                 
-                // Bottom Parameter Controls
+                // Bottom Control Panel
                 VStack(spacing: 12) {
+                    // Parameter Sliders
                     HStack {
-                        Toggle(isOn: $enableSORFilter) {
-                            Text("Filtro Estadístico SOR")
+                        Toggle(isOn: $captureManager.enableSOR) {
+                            Text("Filtro SOR")
                                 .font(.caption.bold())
                         }
                         .toggleStyle(SwitchToggleStyle(tint: .cyan))
                         
                         Spacer()
                         
-                        Text("Profundidad: \(Int(maxDistance * 100)) cm")
+                        Text("Rango Máximo: \(Int(captureManager.maxDepthMeters * 100)) cm")
                             .font(.caption.bold())
                             .foregroundColor(.cyan)
                     }
                     
-                    Slider(value: $maxDistance, in: 0.20...0.70, step: 0.05)
+                    Slider(value: $captureManager.maxDepthMeters, in: 0.20...0.70, step: 0.05)
                         .accentColor(.cyan)
                     
-                    Button(action: startTrueDepthScan) {
-                        HStack(spacing: 10) {
-                            Image(systemName: "camera.metering.matrix")
-                                .font(.title3)
-                            Text("Capturar Modelo 3D Sub-milimétrico")
+                    // Main Action Trigger Button (Continuous Scanner)
+                    Button(action: {
+                        captureManager.toggleScan()
+                    }) {
+                        HStack(spacing: 12) {
+                            Image(systemName: captureManager.isScanning ? "stop.circle.fill" : "play.circle.fill")
+                                .font(.title2)
+                            Text(captureManager.isScanning ? "DETENER ESCANEO Y GENERAR STL" : "INICIAR ESCANEO CONTINUO (O 2x VOL+)")
                                 .font(.headline.bold())
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
+                        .padding(.vertical, 15)
                         .background(
-                            LinearGradient(
-                                colors: [Color.blue, Color.cyan],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
+                            captureManager.isScanning ?
+                            LinearGradient(colors: [Color.red, Color.orange], startPoint: .leading, endPoint: .trailing) :
+                            LinearGradient(colors: [Color.blue, Color.cyan], startPoint: .leading, endPoint: .trailing)
                         )
                         .foregroundColor(.white)
-                        .cornerRadius(12)
+                        .cornerRadius(14)
                     }
-                    .disabled(isProcessing || !captureManager.isSessionRunning)
                     
-                    if capturedMesh != nil {
-                        HStack(spacing: 10) {
-                            Button(action: { showPreviewMode = false }) {
-                                Label("Repetir", systemImage: "arrow.counterclockwise")
-                                    .font(.caption.bold())
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 10)
-                                    .background(Color(UIColor.tertiarySystemFill))
-                                    .foregroundColor(.primary)
-                                    .cornerRadius(10)
-                            }
-                            
-                            Button(action: generateAndShareSTL) {
-                                Label("STL CAD", systemImage: "square.and.arrow.up")
-                                    .font(.caption.bold())
+                    // Secondary Actions
+                    HStack(spacing: 10) {
+                        Button(action: {
+                            captureManager.clearScan()
+                            showPreviewMode = false
+                        }) {
+                            Label("Limpiar", systemImage: "trash")
+                                .font(.subheadline.bold())
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                                .background(Color(UIColor.tertiarySystemFill))
+                                .foregroundColor(.primary)
+                                .cornerRadius(10)
+                        }
+                        
+                        if let stlUrl = captureManager.latestSTLURL {
+                            Button(action: {
+                                self.shareURL = stlUrl
+                                self.showShareSheet = true
+                            }) {
+                                Label("Compartir .STL", systemImage: "square.and.arrow.up.fill")
+                                    .font(.subheadline.bold())
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 10)
                                     .background(Color.green)
                                     .foregroundColor(.white)
                                     .cornerRadius(10)
                             }
-                            
-                            Button(action: generateAndSharePLY) {
+                        }
+                        
+                        if let plyUrl = captureManager.latestPLYURL {
+                            Button(action: {
+                                self.shareURL = plyUrl
+                                self.showShareSheet = true
+                            }) {
                                 Label("PLY Color", systemImage: "paintpalette.fill")
-                                    .font(.caption.bold())
+                                    .font(.subheadline.bold())
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 10)
                                     .background(Color.purple)
@@ -240,156 +270,46 @@ struct ContentView: View {
                 .padding()
                 .background(Color(UIColor.secondarySystemBackground))
             }
-            .navigationTitle("Escáner 3D TrueDepth")
+            .navigationTitle("Bichito 3D Pro")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showShareSheet) {
-                if let url = exportedSTLURL {
+                if let url = shareURL {
                     ShareSheet(activityItems: [url])
                 }
             }
-            .alert(item: Binding<AlertItem?>(
-                get: { errorMessage.map { AlertItem(message: $0) } },
-                set: { _ in errorMessage = nil }
-            )) { item in
-                Alert(title: Text("Aviso de Sistema"), message: Text(item.message), dismissButton: .default(Text("OK")))
-            }
             .onAppear {
-                setupNetworkingCallbacks()
+                UIApplication.shared.isIdleTimerDisabled = true
+                setupNetworking()
                 volumeTrigger.onTriggerAction = {
-                    if !isProcessing && captureManager.isSessionRunning {
-                        startTrueDepthScan()
-                    }
+                    captureManager.toggleScan()
                 }
                 webServer.start()
             }
         }
     }
     
-    private func setupNetworkingCallbacks() {
+    private func setupNetworking() {
         webServer.getLatestJPEG = { captureManager.latestJPEGData }
-        webServer.getLatestSTL = { latestSTLData }
-        webServer.getLatestPLY = { latestPLYData }
-        webServer.onTriggerScan = { maxDist, sorEnabled, planeCut, completion in
-            self.maxDistance = maxDist
-            guard let depthData = captureManager.lastCapturedDepthData else {
-                completion(0)
-                return
-            }
-            
-            DispatchQueue.global(qos: .userInitiated).async {
-                let colorBuf = captureManager.latestColorPixelBuffer
-                if let mesh = MeshGenerator.generateMesh(
-                    from: depthData,
-                    colorPixelBuffer: colorBuf,
-                    minDepth: self.minDistance,
-                    maxDepth: maxDist,
-                    stepSize: self.meshResolution,
-                    enableSOR: sorEnabled,
-                    basePlaneCutoffZ: planeCut
-                ), !mesh.triangles.isEmpty {
-                    let stlUrl = try? STLExporter.exportToBinarySTL(mesh: mesh)
-                    let plyUrl = try? PLYExporter.exportToBinaryPLY(mesh: mesh)
-                    let stlBytes = stlUrl != nil ? try? Data(contentsOf: stlUrl!) : nil
-                    let plyBytes = plyUrl != nil ? try? Data(contentsOf: plyUrl!) : nil
-                    
-                    DispatchQueue.main.async {
-                        self.capturedMesh = mesh
-                        self.exportedSTLURL = stlUrl
-                        self.exportedPLYURL = plyUrl
-                        self.latestSTLData = stlBytes
-                        self.latestPLYData = plyBytes
-                        self.showPreviewMode = true
-                        completion(mesh.triangles.count)
-                    }
-                } else {
-                    DispatchQueue.main.async { completion(0) }
-                }
-            }
+        webServer.getLatestSTL = { captureManager.latestSTLData }
+        webServer.getLatestPLY = { captureManager.latestPLYData }
+        webServer.getLatestNewPoints = { captureManager.latestNewPointsJSON }
+        webServer.getStatusJSON = {
+            let status = captureManager.statusMessage.replacingOccurrences(of: "\"", with: "'")
+            return "{\"isScanning\": \(captureManager.isScanning), \"points\": \(captureManager.pointCount), \"triangles\": \(captureManager.triangleCount), \"status\": \"\(status)\"}"
         }
-        webServer.onTriggerShareOnPhone = { self.generateAndShareSTL() }
-    }
-    
-    private func startTrueDepthScan() {
-        guard let depthData = captureManager.lastCapturedDepthData else {
-            errorMessage = "Apunta el sensor TrueDepth hacia el objeto (20 a 50 cm)."
-            return
+        webServer.onToggleScan = {
+            captureManager.toggleScan()
         }
-        
-        let generator = UIImpactFeedbackGenerator(style: .medium)
-        generator.impactOccurred()
-        
-        isProcessing = true
-        let colorBuf = captureManager.latestColorPixelBuffer
-        
-        DispatchQueue.global(qos: .userInitiated).async {
-            let mesh = MeshGenerator.generateMesh(
-                from: depthData,
-                colorPixelBuffer: colorBuf,
-                minDepth: self.minDistance,
-                maxDepth: self.maxDistance,
-                stepSize: self.meshResolution,
-                enableSOR: self.enableSORFilter,
-                basePlaneCutoffZ: self.basePlaneCutoff > 0 ? self.basePlaneCutoff : nil
-            )
-            
-            DispatchQueue.main.async {
-                self.isProcessing = false
-                if let mesh = mesh, !mesh.triangles.isEmpty {
-                    self.capturedMesh = mesh
-                    self.showPreviewMode = true
-                    
-                    if let url = try? STLExporter.exportToBinarySTL(mesh: mesh) {
-                        self.exportedSTLURL = url
-                        self.latestSTLData = try? Data(contentsOf: url)
-                    }
-                    if let plyUrl = try? PLYExporter.exportToBinaryPLY(mesh: mesh) {
-                        self.exportedPLYURL = plyUrl
-                        self.latestPLYData = try? Data(contentsOf: plyUrl)
-                    }
-                    
-                    let successFeedback = UINotificationFeedbackGenerator()
-                    successFeedback.notificationOccurred(.success)
-                } else {
-                    self.errorMessage = "No se encontraron suficientes puntos en el rango geométrico configurado."
-                }
+        webServer.onClearScan = {
+            captureManager.clearScan()
+        }
+        webServer.onTriggerShareOnPhone = {
+            if let stlUrl = captureManager.latestSTLURL {
+                self.shareURL = stlUrl
+                self.showShareSheet = true
             }
         }
     }
-    
-    private func generateAndShareSTL() {
-        guard let mesh = capturedMesh else { return }
-        do {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyyMMdd_HHmmss"
-            let filename = "TrueDepth_Scan_\(formatter.string(from: Date())).stl"
-            let url = try STLExporter.exportToBinarySTL(mesh: mesh, filename: filename)
-            self.exportedSTLURL = url
-            self.latestSTLData = try? Data(contentsOf: url)
-            self.showShareSheet = true
-        } catch {
-            self.errorMessage = error.localizedDescription
-        }
-    }
-    
-    private func generateAndSharePLY() {
-        guard let mesh = capturedMesh else { return }
-        do {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyyMMdd_HHmmss"
-            let filename = "TrueDepth_ColorScan_\(formatter.string(from: Date())).ply"
-            let url = try PLYExporter.exportToBinaryPLY(mesh: mesh, filename: filename)
-            self.exportedPLYURL = url
-            self.latestPLYData = try? Data(contentsOf: url)
-            self.showShareSheet = true
-        } catch {
-            self.errorMessage = error.localizedDescription
-        }
-    }
-}
-
-struct AlertItem: Identifiable {
-    var id = UUID()
-    var message: String
 }
 
 struct ShareSheet: UIViewControllerRepresentable {
