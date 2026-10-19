@@ -1307,5 +1307,9 @@ class ReconstructionStudioApp:
 # Entry Point
 # =============================================================================
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv)==3 and sys.argv[1]=='--diagnostic':
+        from bundle_checks import run
+        raise SystemExit(run(sys.argv[2]))
     from offline_pipeline import main
     main()

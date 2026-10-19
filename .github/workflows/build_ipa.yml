@@ -20,31 +20,20 @@ jobs:
       - name: Probar protocolo
         working-directory: Windows
         run: python -m unittest discover -p "test_*.py" -v
-      - name: Crear ejecutable portátil
-        working-directory: Windows
-        run: >-
-          python -m PyInstaller --noconfirm --clean --onedir --windowed
-          --name Bichito3D --add-data "bichito_pro_icon_1024.png;."
-          --collect-all open3d --copy-metadata open3d
-          --exclude-module torch --exclude-module tensorflow
-          --exclude-module jax --exclude-module IPython
-          --exclude-module cupy --exclude-module kornia
-          --exclude-module matplotlib.tests
-          Bichito3D_ReconstructionEngine.py
-      - name: Incluir fuentes RTX y modelo neuronal entrenado
-        shell: pwsh
+      - name: Instalar runtime RTX e IA para paquete unico
         run: |
-          Copy-Item Windows/*.py Windows/dist/Bichito3D/
-          Copy-Item Windows/*.bat Windows/dist/Bichito3D/
-          Copy-Item Windows/requirements-gpu.txt Windows/dist/Bichito3D/
-          Copy-Item Windows/models Windows/dist/Bichito3D/models -Recurse
-          Copy-Item DEPTH_MODEL_RESEARCH.md Windows/dist/Bichito3D/
-      - name: Subir app Windows
+          python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+          python -m pip install -r Windows/requirements-gpu.txt
+          python Windows/ai_alignment.py
+      - name: Compilar EXE unico RTX e IA
+        working-directory: Windows
+        run: python -m PyInstaller --noconfirm --clean unified.spec
+      - name: Subir app Windows unificada
         uses: actions/upload-artifact@v4
         with:
-          name: Bichito3D-Windows
-          path: Windows/dist/Bichito3D/
-          compression-level: 6
+          name: Bichito3D-Unificado
+          path: Windows/dist/Bichito3D-Unificado-v3.1.exe
+          compression-level: 0
   build-ipa:
     runs-on: macos-14
     steps:

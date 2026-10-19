@@ -14,7 +14,8 @@ def cuda_module():
     global _cupy
     if _cupy is not None: return _cupy
     if os.name=='nt':
-        base=Path(sysconfig.get_paths()['purelib'])/'nvidia'
+
+        base=Path(getattr(__import__('sys'),'_MEIPASS',sysconfig.get_paths()['purelib']))/'nvidia'
         for folder in ('cuda_runtime','cuda_nvrtc'):
             directory=base/folder/'bin'
             if directory.is_dir():

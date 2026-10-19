@@ -44,6 +44,8 @@ class Settings:
     rgb_guidance: bool = False
     neural_alignment: bool = False
     neural_denoising: bool = False
+
+    model_path: str = ""
     tile_cells: int = 64
 
     def validate(self):
@@ -231,7 +233,8 @@ def prepare_frame(frame,settings):
     safe=np.where(valid,depth,0).astype(np.float32)
     if settings.neural_denoising:
         from neural_depth import denoise_depth
-        safe=denoise_depth(safe,rgb)
+
+        safe=denoise_depth(safe,rgb,settings.model_path or None)
         safe=np.where(valid,np.clip(safe,settings.min_depth_m,settings.max_depth_m),0).astype(np.float32)
     if settings.rgb_guidance:
         total=safe.copy(); weight=(safe>0).astype(np.float32)
@@ -419,9 +422,12 @@ class StableViewer(tk.Canvas):
 
 class OfflineStudio:
     def __init__(self,root):
-        self.root=root; root.title('Bichito 3D 3.0 · Simple / Avanzado · Captura progresiva'); root.geometry('1380x900')
+
+        self.root=root; root.title('Bichito 3D 3.1 · Simple / Avanzado · Captura progresiva'); root.geometry('1380x900')
         self.events=queue.Queue(maxsize=100); self.cancel=threading.Event()
         self.busy,self.mesh,self.session=False,None,None
+
+        self.results={}
         self.phone_active,self.phone_busy=False,False
         self.ip=tk.StringVar(); self.status=tk.StringVar(value='Conecta el iPhone. Durante captura solo se muestra vídeo ligero.')
         self.quality=tk.DoubleVar(value=.5); self.params={}
@@ -461,6 +467,13 @@ class OfflineStudio:
         tabs=ttk.Notebook(left); tabs.pack(fill='both',expand=True,pady=8)
         simple=ttk.Frame(tabs,padding=8); advanced=ttk.Frame(tabs,padding=8)
         tabs.add(simple,text='Simple'); tabs.add(advanced,text='Avanzado')
+        panel=advanced; canvas=tk.Canvas(panel,height=360,highlightthickness=0)
+        scrollbar=ttk.Scrollbar(panel,orient='vertical',command=canvas.yview)
+        scrollbar.pack(side='right',fill='y');canvas.pack(side='left',fill='both',expand=True)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        advanced=ttk.Frame(canvas);window=canvas.create_window((0,0),window=advanced,anchor='nw')
+        advanced.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',lambda event:canvas.itemconfigure(window,width=event.width))
         self.preset_name=tk.StringVar(value='Escaneo Estándar')
         descriptions=['Balance entre velocidad y detalle','Comprobar forma rápidamente','Más detalle en piezas intermedias','0.05 mm solicitados; procesamiento intensivo']
         for name,description in zip(PRESETS,descriptions):
@@ -488,10 +501,35 @@ class OfflineStudio:
         ttk.Checkbutton(advanced,text='Limpieza guiada por RGB (modifica solo reconstrucción)',variable=self.rgb_guidance).pack(anchor='w')
         ttk.Checkbutton(advanced,text='IA LoFTR para alineación (pesos locales)',variable=self.neural_alignment).pack(anchor='w')
         ttk.Checkbutton(advanced,text='IA profundidad experimental (NYU; requiere modo RTX / IA)',variable=self.neural_denoising).pack(anchor='w')
+
+        from model_registry import models,default
+
+        self.model_paths=models(); selected=default()
+
+        if selected not in self.model_paths:self.model_paths.append(selected)
+
+        self.model_choice=tk.StringVar(value=selected.stem)
+
+        self.model_combo=ttk.Combobox(advanced,textvariable=self.model_choice,values=[p.stem for p in self.model_paths],state='readonly')
+
+        self.model_combo.pack(fill='x')
+
+        ttk.Button(advanced,text='Añadir modelo compatible (.pt + .json)',command=self.add_model).pack(fill='x')
+
+        ttk.Button(advanced,text='Establecer modelo predeterminado',command=self.default_model).pack(fill='x')
+
+        self.reconstruction_mode=tk.StringVar(value='RTX sola')
+
+        ttk.Combobox(left,textvariable=self.reconstruction_mode,values=['RTX sola','RTX + IA','Comparar ambas'],state='readonly').pack(fill='x')
+
+        self.result_choice=tk.StringVar()
+
+        self.result_combo=ttk.Combobox(left,textvariable=self.result_choice,state='readonly')
+
+        self.result_combo.pack(fill='x'); self.result_combo.bind('<<ComboboxSelected>>',self.select_result)
         self.apply_preset()
         ttk.Button(left,text='Exportar STL (mm)',command=lambda:self.export('stl')).pack(fill='x')
         ttk.Button(left,text='Exportar PLY color (mm)',command=lambda:self.export('ply')).pack(fill='x',pady=3)
-        ttk.Button(left,text='Abrir modo RTX / IA',command=self.launch_gpu).pack(fill='x',pady=3)
         right=ttk.Frame(body,padding=10); body.add(right,weight=3)
         ttk.Label(right,text='Visor fijo · arrastrar: giro manual · rueda: zoom').pack()
         ttk.Button(right,text='Restablecer vista',command=lambda:self.viewer.reset()).pack(anchor='e')
@@ -508,29 +546,61 @@ class OfflineStudio:
         self.neural_denoising.set(preset.neural_denoising)
         self.res_label.config(text=f'{preset.resolution_mm:.3f} mm')
 
-    def launch_gpu(self):
-        if self.busy or self.phone_active:
-            self.status.set('Finaliza la captura o reconstrucción antes de cambiar al modo RTX.'); return
-        import sys,subprocess
-        base=Path(__file__).parent
-        if getattr(sys,'frozen',False):
-            local=Path(sys.executable).parent
-            base=local.parent if (local.parent/'.gpu-runtime'/'Scripts'/'python.exe').exists() else local
-        python=base/'.gpu-runtime'/'Scripts'/'python.exe'
-        entry=base/'Bichito3D_ReconstructionEngine.py'
-        if not python.exists() or not entry.exists():
-            self.status.set('El runtime RTX no está instalado junto al proyecto. Usa Instalar_GPU.bat.'); return
-        with open(base/'gpu-launch.log','a',encoding='utf-8') as log:
-            subprocess.Popen([str(python),str(entry)],cwd=base,stdout=log,stderr=log,
-                             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-        self.close()
+
+    def selected_model(self):
+
+        return next(p for p in self.model_paths if p.stem==self.model_choice.get())
+
+
+    def add_model(self):
+
+        path=filedialog.askopenfilename(filetypes=[('Checkpoint compatible','*.pt')])
+
+        if not path:return
+
+        try:
+
+            from model_registry import install
+
+            target=install(path);self.model_paths.append(target)
+
+            self.model_combo['values']=[p.stem for p in self.model_paths];self.model_choice.set(target.stem)
+
+            self.status.set('Modelo validado y añadido. Usa Establecer predeterminado para conservar la selección.')
+
+        except Exception as error:self.status.set(str(error))
+
+
+    def default_model(self):
+
+        try:
+
+            from model_registry import set_default
+
+            set_default(self.selected_model());self.status.set('Modelo predeterminado guardado.')
+
+        except Exception as error:self.status.set(str(error))
+
+
+    def select_result(self,event=None):
+
+        if self.busy:return
+
+        value=self.results.get(self.result_choice.get())
+
+        if value:
+
+            self.mesh,report=value;self.viewer.set_mesh(self.mesh)
+
+            self.status.set(f'Resultado seleccionado: {self.result_choice.get()} · {report["triangles"]:,} triángulos. Exportar usa este resultado.')
 
     def read_settings(self):
         data={key:float(var.get()) for key,var in self.params.items()}
         for name in ('memory_mb','stride'):
             if data[name]!=int(data[name]): raise ValueError(f'{name} debe ser entero')
             data[name]=int(data[name])
-        data['device']=self.device.get(); data['rgb_guidance']=self.rgb_guidance.get(); data['neural_alignment']=self.neural_alignment.get(); data['neural_denoising']=self.neural_denoising.get(); return Settings(**data).validate()
+
+        data['model_path']=str(self.selected_model()); data['device']=self.device.get(); data['rgb_guidance']=self.rgb_guidance.get(); data['neural_alignment']=self.neural_alignment.get(); data['neural_denoising']=self.neural_denoising.get(); return Settings(**data).validate()
 
     def phone_request(self,path):
         ip=self.ip.get().strip()
@@ -581,11 +651,19 @@ class OfflineStudio:
                     self.cancel.set()
                     self.status.set('Captura iniciada en el iPhone: cancelando reconstrucción para priorizar la captura.')
             elif kind=='received':
+
+                self.results={};self.result_combo['values']=[];self.result_choice.set('');self.mesh=None
                 self.session,receipt=value
                 self.status.set(f'Sesión verificada: {receipt["frames"]} frames, {receipt["dropped"]} omitidos en captura. Pulsa Reconstruir.')
             elif kind=='progress':
                 current,total,accepted,rejected,device,fitness,rmse=value; self.progress['value']=current/total*100
                 self.status.set(f'Reconstruyendo {current}/{total} · {accepted} aceptados · {rejected} rechazados · {device} · RMSE {rmse*1000:.2f} mm')
+
+            elif kind=='comparison':
+
+                self.busy=False;self.results=value;self.result_combo['values']=list(value)
+
+                self.result_choice.set(next(iter(value)));self.select_result()
             elif kind=='result':
                 self.busy=False; self.mesh,report=value; self.viewer.set_mesh(self.mesh)
                 self.status.set(f'Modelo listo: {report["vertices"]:,} vértices, {report["triangles"]:,} triángulos · {report["device"]}')
@@ -619,12 +697,32 @@ class OfflineStudio:
             import importlib.util
             if importlib.util.find_spec('torch') is None:
                 self.status.set('La IA necesita el runtime local. Pulsa Abrir modo RTX / IA y activa allí la opción.'); return
+
+        self.reconstruction_mode_value=self.reconstruction_mode.get()
+        self.results={};self.mesh=None;self.result_combo["values"]=[];self.result_choice.set("")
         self.busy=True; self.cancel.clear(); path=self.session; self.status.set('Preparando reconstrucción diferida…')
         def worker():
             try:
-                mesh,report=reconstruct(path,settings,lambda *args:self.post('progress',args),self.cancel)
-                Path(path).with_suffix('.reconstruction.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
-                self.post('result',(mesh,report))
+
+                from dataclasses import replace
+
+                mode=self.reconstruction_mode_value
+
+                variants=['RTX sola','RTX + IA'] if mode=='Comparar ambas' else [mode]
+
+                results={}
+
+                for variant in variants:
+
+                    config=replace(settings,device='CUDA',neural_denoising=variant=='RTX + IA',neural_alignment=settings.neural_alignment if variant=='RTX + IA' else False)
+
+                    mesh,report=reconstruct(path,config,lambda *args:self.post('progress',args),self.cancel)
+
+                    Path(path).with_suffix('.'+('rtx-ai' if variant=='RTX + IA' else 'rtx')+'.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+
+                    results[variant]=(mesh,report)
+
+                self.post('comparison',results)
             except Exception as error: self.post('reconstruction_error',str(error))
         threading.Thread(target=worker,daemon=True).start()
 

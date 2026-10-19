@@ -53,7 +53,11 @@ class DepthDenoiser:
         return np.where(valid,np.clip(output,safe-.01,safe+.01),0).astype(np.float32)
 
 _denoiser=None
-def denoise_depth(depth,rgb):
+
+def denoise_depth(depth,rgb,path=None):
     global _denoiser
-    if _denoiser is None: _denoiser=DepthDenoiser()
+
+    if _denoiser is None or getattr(_denoiser,"source",None)!=path:
+
+        _denoiser=DepthDenoiser(path); _denoiser.source=path
     return _denoiser.denoise(depth,rgb)

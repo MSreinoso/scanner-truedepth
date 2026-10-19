@@ -202,9 +202,7 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
         lock.lock()
         if processing {
             if captureGate { dropped += 1 }
-            let shouldStop = captureGate && dropped == 5
             lock.unlock()
-            if shouldStop { DispatchQueue.main.async { self.stopScan() } }
             return
         }
         processing = true
@@ -218,8 +216,7 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                       !d.depthDataWasDropped, !v.sampleBufferWasDropped,
                       let pixel = CMSampleBufferGetImageBuffer(v.sampleBuffer) else {
                     if self.scanActive {
-                        self.lock.lock(); self.dropped += 1; let stop = self.dropped >= 5; self.lock.unlock()
-                        if stop { DispatchQueue.main.async { self.stopScan() } }
+                        self.lock.lock(); self.dropped += 1; self.lock.unlock()
                     }
                     return
                 }
@@ -229,7 +226,13 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                         guard let packet = FrameSerializer.serialize(frameID: self.frameID, timestamp: timestamp,
                             depthData: d.depthData, colorPixelBuffer: pixel,
                             deviceMotion: self.motionTracker.latestDeviceMotion, rawCapture: true) else {
-                            throw CocoaError(.fileWriteUnknown)
+                            // Startup may temporarily provide depth without calibration.
+                            // Skip this sample; it is not a fatal storage failure.
+                            self.lock.lock(); self.dropped += 1; self.lock.unlock()
+                            if self.recorder.count == 0 {
+                                DispatchQueue.main.async { self.statusMessage = "Esperando frame TrueDepth calibrado…" }
+                            }
+                            return
                         }
                         try self.recorder.append(packet)
                         self.frameID &+= 1
@@ -239,14 +242,16 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                         if total % 5 == 0 {
                             DispatchQueue.main.async {
                                 self.capturedFrames = total; self.recordedMB = mb; self.droppedFrames = missed
-                                if missed >= 5 || ProcessInfo.processInfo.thermalState == .critical {
+                                if ProcessInfo.processInfo.thermalState == .critical {
                                     self.stopScan()
                                 }
                             }
                         }
                     } catch {
-                        DispatchQueue.main.async { self.stopScan() }
-                        self.report(error.localizedDescription, busy: true)
+                        DispatchQueue.main.async {
+                            self.stopScan()
+                            self.statusMessage = error.localizedDescription
+                        }
                     }
                 }
                 // Five small JPEGs per second, independent of raw capture storage.
