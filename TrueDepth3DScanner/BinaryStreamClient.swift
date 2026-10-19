@@ -170,6 +170,7 @@ final class BinaryStreamClient: ObservableObject {
     var canAcceptFrame: Bool {
         streamQueue.sync { ready && !sending }
     }
+    var targetAddress: String { streamQueue.sync { targetIP } }
 
     func sendFrame(_ data: Data) {
         streamQueue.sync {

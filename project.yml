@@ -13,8 +13,12 @@ targets:
       path: TrueDepth3DScanner/Info.plist
       properties:
         CFBundleDisplayName: "Bichito 3D Pro"
-        CFBundleShortVersionString: "1.1"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "2.0"
+        CFBundleVersion: "3"
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
         NSCameraUsageDescription: "Se requiere acceso a la cámara TrueDepth (Face ID) para capturar el mapa de profundidad y reconstruir la geometría 3D."
         NSLocalNetworkUsageDescription: "Se utiliza la red Wi-Fi local para transmitir la vista del escáner 3D en tiempo real hacia el navegador de tu PC."
         NSMotionUsageDescription: "Se requiere acceso a los sensores de movimiento para estabilizar y anclar la nube de puntos 3D en el espacio real."

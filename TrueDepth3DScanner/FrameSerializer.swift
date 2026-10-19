@@ -67,7 +67,8 @@ final class FrameSerializer {
         depthData: AVDepthData,
         colorPixelBuffer: CVPixelBuffer?,
         deviceMotion: CMDeviceMotion?,
-        jpegQuality: CGFloat = 0.80
+        jpegQuality: CGFloat = 0.80,
+        rawCapture: Bool = false
     ) -> Data? {
 
         // ──────────────────────────────────────────────
@@ -81,6 +82,7 @@ final class FrameSerializer {
         }
 
         let depthBuffer = convertedDepth.depthDataMap
+        if rawCapture && convertedDepth.cameraCalibrationData == nil { return nil }
         CVPixelBufferLockBaseAddress(depthBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthBuffer, .readOnly) }
 
@@ -114,20 +116,21 @@ final class FrameSerializer {
         // ──────────────────────────────────────────────
         // 3. Convert depth Float32 → Float16
         // ──────────────────────────────────────────────
-        let pixelCount  = depthWidth * depthHeight
-        let halfSize    = pixelCount * MemoryLayout<Float16>.size
-
-        var halfBuffer  = Data(count: halfSize)
-        halfBuffer.withUnsafeMutableBytes { halfPtr in
-            let dst = halfPtr.bindMemory(to: Float16.self)
-            let src = depthBaseAddress.assumingMemoryBound(to: Float32.self)
-            let srcRowFloats = depthBytesPerRow / MemoryLayout<Float32>.size
-
-            for row in 0..<depthHeight {
-                let rowOffset = row * srcRowFloats
-                let dstOffset = row * depthWidth
-                for col in 0..<depthWidth {
-                    dst[dstOffset + col] = Float16(src[rowOffset + col])
+        let pixelCount = depthWidth * depthHeight
+        let halfSize = pixelCount * (rawCapture ? 4 : 2)
+        var halfBuffer = Data(count: halfSize)
+        halfBuffer.withUnsafeMutableBytes { dstRaw in
+            let source = depthBaseAddress.assumingMemoryBound(to: Float32.self)
+            let stride = depthBytesPerRow / 4
+            if rawCapture {
+                for row in 0..<depthHeight {
+                    memcpy(dstRaw.baseAddress!.advanced(by: row * depthWidth * 4),
+                           source.advanced(by: row * stride), depthWidth * 4)
+                }
+            } else {
+                let dest = dstRaw.bindMemory(to: Float16.self)
+                for row in 0..<depthHeight {
+                    for col in 0..<depthWidth { dest[row * depthWidth + col] = Float16(source[row * stride + col]) }
                 }
             }
         }
@@ -135,10 +138,13 @@ final class FrameSerializer {
         // ──────────────────────────────────────────────
         // 4. Zlib-compress the Float16 depth payload
         // ──────────────────────────────────────────────
+        var compressedDepth = halfBuffer
+        var compressedSize = halfSize
+        if !rawCapture {
         let compressedBound = halfSize + 512  // zlib can expand slightly on tiny data
-        var compressedDepth = Data(count: compressedBound)
+        compressedDepth = Data(count: compressedBound)
 
-        let compressedSize: Int = halfBuffer.withUnsafeBytes { srcRaw in
+        compressedSize = halfBuffer.withUnsafeBytes { srcRaw in
             let srcPtr = srcRaw.bindMemory(to: UInt8.self).baseAddress!
             return compressedDepth.withUnsafeMutableBytes { dstRaw in
                 let dstPtr = dstRaw.bindMemory(to: UInt8.self).baseAddress!
@@ -154,6 +160,8 @@ final class FrameSerializer {
         guard compressedSize > 0 else { return nil }
         compressedDepth.count = compressedSize
 
+        }
+
         // ──────────────────────────────────────────────
         // 5. RGB → JPEG
         // ──────────────────────────────────────────────
@@ -165,12 +173,26 @@ final class FrameSerializer {
             rgbWidth  = UInt16(CVPixelBufferGetWidth(colorPB))
             rgbHeight = UInt16(CVPixelBufferGetHeight(colorPB))
 
+            if rawCapture {
+                CVPixelBufferLockBaseAddress(colorPB, .readOnly)
+                defer { CVPixelBufferUnlockBaseAddress(colorPB, .readOnly) }
+                guard let base = CVPixelBufferGetBaseAddress(colorPB) else { return nil }
+                let rowBytes = Int(rgbWidth) * 4
+                jpegData = Data(count: rowBytes * Int(rgbHeight))
+                jpegData.withUnsafeMutableBytes { dst in
+                    for row in 0..<Int(rgbHeight) {
+                        memcpy(dst.baseAddress!.advanced(by: row * rowBytes),
+                               base.advanced(by: row * CVPixelBufferGetBytesPerRow(colorPB)), rowBytes)
+                    }
+                }
+            } else {
             let ciImage = CIImage(cvPixelBuffer: colorPB)
             if let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) {
                 let uiImage = UIImage(cgImage: cgImage)
                 if let encoded = uiImage.jpegData(compressionQuality: jpegQuality) {
                     jpegData = encoded
                 }
+            }
             }
         }
 
@@ -213,7 +235,7 @@ final class FrameSerializer {
         var packet = Data(capacity: totalSize)
 
         // Magic
-        appendValue(magic, to: &packet)
+        appendValue(rawCapture ? UInt32(0xB1C01702) : magic, to: &packet)
         // Frame ID
         appendValue(frameID, to: &packet)
         // Timestamp (float64)
@@ -250,6 +272,21 @@ final class FrameSerializer {
         appendValue(UInt32(jpegData.count), to: &packet)
         packet.append(jpegData)
 
+        if rawCapture {
+            var calibrationInfo: [String: Any] = ["rgbAlignment": "AVFoundation synchronized depth/video, native orientation"]
+            calibrationInfo["motionTimestamp"] = deviceMotion?.timestamp
+            if let cal = convertedDepth.cameraCalibrationData {
+                calibrationInfo["referenceSize"] = [cal.intrinsicMatrixReferenceDimensions.width, cal.intrinsicMatrixReferenceDimensions.height]
+                calibrationInfo["distortionCenter"] = [cal.lensDistortionCenter.x, cal.lensDistortionCenter.y]
+                if let table = cal.lensDistortionLookupTable {
+                    calibrationInfo["lensTable"] = table.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+                }
+                calibrationInfo["extrinsics"] = (0..<4).flatMap { col in (0..<3).map { row in cal.extrinsicMatrix[col][row] } }
+            }
+            let metadata = (try? JSONSerialization.data(withJSONObject: calibrationInfo)) ?? Data("{}".utf8)
+            appendValue(UInt32(metadata.count), to: &packet)
+            packet.append(metadata)
+        }
         return packet
     }
 

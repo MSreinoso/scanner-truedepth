@@ -1307,10 +1307,5 @@ class ReconstructionStudioApp:
 # Entry Point
 # =============================================================================
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ReconstructionStudioApp(root)
-    root.lift()
-    root.attributes('-topmost', True)
-    root.after_idle(root.attributes, '-topmost', False)
-    root.focus_force()
-    root.mainloop()
+    from offline_pipeline import main
+    main()

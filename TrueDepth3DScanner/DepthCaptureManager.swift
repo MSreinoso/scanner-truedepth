@@ -3,151 +3,48 @@ import Combine
 import AVFoundation
 import CoreImage
 import UIKit
-import simd
+import CryptoKit
 
-/// Unique 3D spatial voxel grid coordinate key for deduplication.
-struct VoxelKey: Hashable {
-    let x: Int32
-    let y: Int32
-    let z: Int32
-}
-
-/// Canonical key for triangular facet deduplication across frames.
-struct TriangleVoxelKey: Hashable {
-    let k1: VoxelKey
-    let k2: VoxelKey
-    let k3: VoxelKey
-    
-    init(_ a: VoxelKey, _ b: VoxelKey, _ c: VoxelKey) {
-        var arr = [a, b, c]
-        arr.sort {
-            if $0.x != $1.x { return $0.x < $1.x }
-            if $0.y != $1.y { return $0.y < $1.y }
-            return $0.z < $1.z
-        }
-        self.k1 = arr[0]
-        self.k2 = arr[1]
-        self.k3 = arr[2]
-    }
-}
-
-/// High-performance continuous 3D scanner manager.
-/// Streams frames at 30 FPS, continuously integrates multi-shot depth buffers into a spatial voxel grid,
-/// performs temporal denoising, and outputs CAD binary STL / PLY models.
-class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchronizerDelegate {
+/// Capture only: raw depth + BGRA on disk, lightweight preview, post-scan upload.
+final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchronizerDelegate {
     @Published var isSessionRunning = false
     @Published var isScanning = false
-    @Published var pointCount = 0
-    @Published var triangleCount = 0
-    @Published var statusMessage: String = "Iniciando sensor TrueDepth..."
-    @Published var latestMesh: Mesh3D?
-    
-    // User-configurable parameters
-    var maxDepthMeters: Float = 0.50
-    var minDepthMeters: Float = 0.15
-    var voxelSizeMeters: Float = 0.001 // 1.0 mm (metrological resolution)
-    var enableSOR: Bool = true
-    var basePlaneCutoffZ: Float? = nil
-    
-    // HTTP readers and camera/export writers share these snapshots safely.
-    private let cacheLock = NSLock()
-    private var _latestJPEGData: Data?
-    private(set) var latestJPEGData: Data? {
-        get {
-            cacheLock.lock()
-            defer { cacheLock.unlock() }
-            return _latestJPEGData
-        }
-        set {
-            cacheLock.lock()
-            defer { cacheLock.unlock() }
-            _latestJPEGData = newValue
-        }
-    }
-    private(set) var latestColorPixelBuffer: CVPixelBuffer?
-    private(set) var latestSTLURL: URL?
-    private(set) var latestPLYURL: URL?
-    private var _latestSTLData: Data?
-    private(set) var latestSTLData: Data? {
-        get {
-            cacheLock.lock()
-            defer { cacheLock.unlock() }
-            return _latestSTLData
-        }
-        set {
-            cacheLock.lock()
-            defer { cacheLock.unlock() }
-            _latestSTLData = newValue
-        }
-    }
-    private var _latestPLYData: Data?
-    private(set) var latestPLYData: Data? {
-        get {
-            cacheLock.lock()
-            defer { cacheLock.unlock() }
-            return _latestPLYData
-        }
-        set {
-            cacheLock.lock()
-            defer { cacheLock.unlock() }
-            _latestPLYData = newValue
-        }
-    }
-    private var _latestNewPointsJSON: Data?
-    private(set) var latestNewPointsJSON: Data? {
-        get {
-            cacheLock.lock()
-            defer { cacheLock.unlock() }
-            return _latestNewPointsJSON
-        }
-        set {
-            cacheLock.lock()
-            defer { cacheLock.unlock() }
-            _latestNewPointsJSON = newValue
-        }
-    }
-    
-    // Accumulated 3D Geometry
-    private var voxelSet = Set<VoxelKey>()
-    private var triangleSet = Set<TriangleVoxelKey>()
-    private var accumulatedVertices: [SIMD3<Float>] = []
-    private var accumulatedColors: [SIMD3<UInt8>] = []
-    private var accumulatedTriangles: [Triangle3D] = []
-    
-    // Thread Isolation & Queues
+    @Published var isBusy = false
+    @Published var capturedFrames = 0
+    @Published var droppedFrames = 0
+    @Published var recordedMB = 0.0
+    @Published var statusMessage = "Iniciando TrueDepth…"
     let captureSession = AVCaptureSession()
-    private let sessionQueue = DispatchQueue(label: "com.truedepth.sessionQueue", qos: .userInitiated)
-    private let synchronizerQueue = DispatchQueue(label: "com.truedepth.syncQueue", qos: .userInteractive)
-    private let processingQueue = DispatchQueue(label: "com.truedepth.processingQueue", qos: .userInitiated)
-    
-    // Backpressure guard
-    private var isProcessingFrame = false
-    private let processLock = NSLock()
-    
-    private var dataOutputSynchronizer: AVCaptureDataOutputSynchronizer?
+    let streamClient = BinaryStreamClient()
+    private let sessionQueue = DispatchQueue(label: "com.bichito.session")
+    private let synchronizerQueue = DispatchQueue(label: "com.bichito.sync")
+    private let processingQueue = DispatchQueue(label: "com.bichito.capture")
+    private let transferQueue = DispatchQueue(label: "com.bichito.transfer", qos: .utility)
     private let videoDataOutput = AVCaptureVideoDataOutput()
     private let depthDataOutput = AVCaptureDepthDataOutput()
-    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-    private var frameCounter: Int = 0
-    private var scanActive = false // Only accessed on processingQueue.
-    private var lastPreviewTime = -Double.infinity
-    private var lastIntegrationTime = -Double.infinity
-    private let maxLocalVertices = 120_000
-    private let maxLocalTriangleKeys = 180_000
-    
-    // 6DoF Inertial Motion Tracker (60 Hz IMU fusion for spatial anchoring)
-    let motionTracker = MotionTracker()
-    
-    // Persistent TCP Binary Streaming Client (EinStar architecture)
-    let streamClient = BinaryStreamClient()
-    private var streamFrameID: UInt32 = 0
-    
+    private var dataOutputSynchronizer: AVCaptureDataOutputSynchronizer?
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private let motionTracker = MotionTracker()
+    private let recorder = CaptureRecorder()
+    private var scanActive = false
+    private var frameID: UInt32 = 0
+    private var lastPreview = -Double.infinity
+    private let lock = NSLock()
+    private var processing = false
+    private var dropped = 0
+    private var captureGate = false // Protected by lock, including synchronizer callbacks.
+    private var jpeg: Data?
+    var latestJPEGData: Data? {
+        lock.lock(); defer { lock.unlock() }
+        return jpeg
+    }
+
     override init() {
         super.init()
         streamClient.startDiscovery()
         checkPermissionsAndConfigure()
     }
-    
+
     private func checkPermissionsAndConfigure() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -190,8 +87,8 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
             // Respect the video format's supported rate; depth is usually 30 Hz.
             try device.lockForConfiguration()
             for range in device.activeFormat.videoSupportedFrameRateRanges {
-                if range.minFrameRate <= 30 && range.maxFrameRate >= 30 {
-                    let rate = 30.0
+                if range.minFrameRate <= 15 && range.maxFrameRate >= 15 {
+                    let rate = 15.0
                     device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
                     device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
                     break
@@ -233,379 +130,171 @@ class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutputSynchr
         }
     }
     
-    // MARK: - Continuous Scan State Machine
     func toggleScan() {
-        if isScanning {
-            stopScan()
-        } else {
-            startScan()
-        }
+        if isScanning { stopScan() } else { startScan() }
     }
-    
+
     func startScan() {
-        guard isSessionRunning else { return }
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.success)
-        
-        // Lock 6DoF spatial anchor to current camera origin and start 60 Hz inertial tracking
-        motionTracker.resetAnchor()
-        motionTracker.startTracking()
-        
+        guard isSessionRunning, !isBusy, !isScanning else { return }
+        isBusy = true
         processingQueue.async { [weak self] in
             guard let self = self else { return }
-            self.scanActive = true
-            self.streamFrameID = 0
-            DispatchQueue.main.async {
-                self.isScanning = true
-                self.statusMessage = "Capturando 3D. Comprueba TCP conectado para recibir en Windows."
-            }
+            do {
+                try self.recorder.start()
+                self.frameID = 0
+                self.lock.lock(); self.dropped = 0; self.captureGate = true; self.lock.unlock()
+                self.motionTracker.startTracking()
+                self.scanActive = true
+                DispatchQueue.main.async {
+                    self.isBusy = false
+                    self.isScanning = true
+                    self.capturedFrames = 0
+                    self.droppedFrames = 0
+                    self.statusMessage = "Capturando en disco. Solo vista ligera hacia Windows."
+                }
+            } catch { self.report(error.localizedDescription) }
         }
     }
-    
+
     func stopScan() {
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.warning)
-        
-        // Stop motion sensor updates
-        motionTracker.stopTracking()
-        
+        guard isScanning, !isBusy else { return }
+        isScanning = false
+        isBusy = true
         processingQueue.async { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, self.scanActive else { return }
             self.scanActive = false
-            
-            // Build final Mesh3D from accumulated geometry
-            let mesh = Mesh3D(
-                vertices: self.accumulatedVertices,
-                vertexColors: self.accumulatedColors,
-                normals: [],
-                triangles: self.accumulatedTriangles
-            )
-            
-            let stlUrl = try? STLExporter.exportToBinarySTL(mesh: mesh)
-            let plyUrl = try? PLYExporter.exportToBinaryPLY(mesh: mesh)
-            let stlBytes = stlUrl != nil ? try? Data(contentsOf: stlUrl!) : nil
-            let plyBytes = plyUrl != nil ? try? Data(contentsOf: plyUrl!) : nil
-            
-            DispatchQueue.main.async {
-                self.isScanning = false
-                self.latestMesh = mesh
-                self.latestSTLURL = stlUrl
-                self.latestPLYURL = plyUrl
-                self.latestSTLData = stlBytes
-                self.latestPLYData = plyBytes
-                self.statusMessage = "Escaneo completado: \(self.accumulatedVertices.count) pts, \(self.accumulatedTriangles.count) triángulos."
-            }
+            self.motionTracker.stopTracking()
+            self.lock.lock(); self.captureGate = false; let lost = self.dropped; self.lock.unlock()
+            do {
+                let url = try self.recorder.finish(dropped: lost)
+                let count = self.recorder.count
+                DispatchQueue.main.async { self.capturedFrames = count; self.droppedFrames = lost }
+                guard count > 0 else { self.report("No se obtuvieron frames TrueDepth. Revisa el sensor."); return }
+                self.report("Comprimiendo captura finalizada…", busy: true)
+                self.transferQueue.async {
+                    do {
+                        let (archive, digest) = try CaptureRecorder.compress(url)
+                        self.upload(archive, digest: digest)
+                    } catch { self.report("Captura conservada: \(error.localizedDescription)") }
+                }
+            } catch { self.report("Error cerrando captura: \(error.localizedDescription)") }
         }
     }
-    
-    func clearScan() {
-        motionTracker.resetAnchor()
-        processingQueue.async { [weak self] in
+
+    func retryTransfer() {
+        guard !isBusy, !isScanning else { return }
+        isBusy = true
+        transferQueue.async { [weak self] in
             guard let self = self else { return }
-            self.lastIntegrationTime = -Double.infinity
-            self.voxelSet.removeAll()
-            self.triangleSet.removeAll()
-            self.accumulatedVertices.removeAll()
-            self.accumulatedColors.removeAll()
-            self.accumulatedTriangles.removeAll()
-            self.latestNewPointsJSON = nil
-            self.latestSTLURL = nil
-            self.latestPLYURL = nil
-            self.latestSTLData = nil
-            self.latestPLYData = nil
-            
-            DispatchQueue.main.async {
-                self.pointCount = 0
-                self.triangleCount = 0
-                self.latestMesh = nil
-                self.statusMessage = "Escaneo limpiado. Listo para nueva captura."
+            let files = (try? FileManager.default.contentsOfDirectory(at: CaptureRecorder.directory, includingPropertiesForKeys: nil)) ?? []
+            guard let archive = files.filter({ $0.pathExtension == "b3dz" && !FileManager.default.fileExists(atPath: $0.appendingPathExtension("received").path) }).sorted(by: { $0.path < $1.path }).first else {
+                self.report("No hay paquetes pendientes. Las capturas están en Archivos > Bichito 3D Pro > Scans.")
+                return
             }
+            do {
+                let input = try FileHandle(forReadingFrom: archive)
+                defer { try? input.close() }
+                var hash = SHA256()
+                while let data = try input.read(upToCount: 262144), !data.isEmpty { hash.update(data: data) }
+                self.upload(archive, digest: hash.finalize().map { String(format: "%02x", $0) }.joined())
+            } catch { self.report(error.localizedDescription) }
         }
     }
-    
-    // MARK: - AVCaptureDataOutputSynchronizerDelegate
-    func dataOutputSynchronizer(_ synchronizer: AVCaptureDataOutputSynchronizer,
-                                didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection) {
-        processLock.lock()
-        if isProcessingFrame {
-            processLock.unlock()
+
+    private func upload(_ archive: URL, digest: String) {
+        let ip = streamClient.targetAddress
+        guard !ip.isEmpty, let url = URL(string: "http://\(ip):50507/sessions/\(archive.deletingPathExtension().lastPathComponent)") else {
+            report("Paquete conservado. Conecta el PC y pulsa Reintentar envío.")
             return
         }
-        isProcessingFrame = true
-        processLock.unlock()
-        
-        processingQueue.async { [weak self] in
-            defer {
-                self?.processLock.lock()
-                self?.isProcessingFrame = false
-                self?.processLock.unlock()
-            }
-            
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.timeoutInterval = 1800
+        request.setValue("application/x-bichito-deflate", forHTTPHeaderField: "Content-Type")
+        request.setValue(digest, forHTTPHeaderField: "X-Content-SHA256")
+        report("Enviando paquete completo a Windows…", busy: true)
+        URLSession.shared.uploadTask(with: request, fromFile: archive) { [weak self] data, response, error in
             guard let self = self else { return }
-
-            autoreleasepool {
-
-                // Extract synchronized Depth Buffer
-                guard let synchDepthData = synchronizedDataCollection.synchronizedData(for: self.depthDataOutput) as? AVCaptureSynchronizedDepthData,
-                      !synchDepthData.depthDataWasDropped else {
-                    return
-                }
-
-                let depthData = synchDepthData.depthData
-
-                // Extract synchronized Video Buffer
-                guard let synchVideoData = synchronizedDataCollection.synchronizedData(for: self.videoDataOutput) as? AVCaptureSynchronizedSampleBufferData,
-                      !synchVideoData.sampleBufferWasDropped,
-                      let pixelBuffer = CMSampleBufferGetImageBuffer(synchVideoData.sampleBuffer) else {
-                    return
-                }
-
-                self.latestColorPixelBuffer = pixelBuffer
-
-                // Generate streaming JPEG for live preview
-                let timestamp = CMSampleBufferGetPresentationTimeStamp(synchVideoData.sampleBuffer).seconds
-                if timestamp - self.lastPreviewTime >= 0.1 {
-                    self.lastPreviewTime = timestamp
-                    let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
-                    if let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) {
-                        let uiImage = UIImage(cgImage: cgImage)
-                        self.latestJPEGData = uiImage.jpegData(compressionQuality: 0.5)
-                    }
-                }
-
-                // State B: Active Video Scan -> Stream synchronized raw 30 FPS frames to PC
-                if self.scanActive {
-                    let motion = self.motionTracker.latestDeviceMotion
-
-                    if self.streamClient.canAcceptFrame, let packet = FrameSerializer.serialize(
-                        frameID: self.streamFrameID,
-                        timestamp: timestamp,
-                        depthData: depthData,
-                        colorPixelBuffer: pixelBuffer,
-                        deviceMotion: motion
-                    ) {
-                        self.streamClient.sendFrame(packet)
-                        self.streamFrameID &+= 1
-                    }
-
-                    // Also integrate locally for device preview
-                    if timestamp - self.lastIntegrationTime >= 0.2 {
-                        self.lastIntegrationTime = timestamp
-                        self.integrateDepthFrame(depthData: depthData, colorBuffer: self.latestColorPixelBuffer)
-                    }
-                }
+            guard error == nil, let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let data = data, let receipt = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  receipt["sha256"] as? String == digest else {
+                self.report("Envío pendiente: \(error?.localizedDescription ?? "Windows no confirmó el paquete"). Datos conservados.")
+                return
             }
+            FileManager.default.createFile(atPath: archive.appendingPathExtension("received").path, contents: data)
+            self.report("Windows recibió y verificó la sesión. Reconstruye en el PC; originales conservados.")
+        }.resume()
+    }
+
+    private func report(_ text: String, busy: Bool = false) {
+        DispatchQueue.main.async { [weak self] in
+            self?.statusMessage = text
+            self?.isBusy = busy
         }
     }
 
-    // MARK: - Continuous Voxel Grid & Surface Integration
-    private func integrateDepthFrame(depthData: AVDepthData, colorBuffer: CVPixelBuffer?) {
-        // Local preview is bounded; full reconstruction continues on Windows.
-        guard accumulatedVertices.count < maxLocalVertices,
-              triangleSet.count < maxLocalTriangleKeys else { return }
-        let depthDataConverted: AVDepthData = (depthData.depthDataType != kCVPixelFormatType_DepthFloat32) ?
-            depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32) : depthData
-        
-        let depthBuffer = depthDataConverted.depthDataMap
-        CVPixelBufferLockBaseAddress(depthBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(depthBuffer, .readOnly) }
-        
-        guard let depthBaseAddress = CVPixelBufferGetBaseAddress(depthBuffer) else { return }
-        let depthWidth = CVPixelBufferGetWidth(depthBuffer)
-        let depthHeight = CVPixelBufferGetHeight(depthBuffer)
-        let depthFloatBuffer = depthBaseAddress.assumingMemoryBound(to: Float32.self)
-        let depthRowFloats = CVPixelBufferGetBytesPerRow(depthBuffer) / MemoryLayout<Float32>.size
-        
-        // Lock color buffer if available
-        var colorBaseAddress: UnsafeMutableRawPointer? = nil
-        var colorBytesPerRow: Int = 0
-        var colorWidth = 0, colorHeight = 0
-        if let colorBuf = colorBuffer {
-            CVPixelBufferLockBaseAddress(colorBuf, .readOnly)
-            colorBaseAddress = CVPixelBufferGetBaseAddress(colorBuf)
-            colorBytesPerRow = CVPixelBufferGetBytesPerRow(colorBuf)
-            colorWidth = CVPixelBufferGetWidth(colorBuf)
-            colorHeight = CVPixelBufferGetHeight(colorBuf)
+    func dataOutputSynchronizer(_ synchronizer: AVCaptureDataOutputSynchronizer,
+                                didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection) {
+        lock.lock()
+        if processing {
+            if captureGate { dropped += 1 }
+            let shouldStop = captureGate && dropped == 5
+            lock.unlock()
+            if shouldStop { DispatchQueue.main.async { self.stopScan() } }
+            return
         }
-        defer {
-            if let colorBuf = colorBuffer { CVPixelBufferUnlockBaseAddress(colorBuf, .readOnly) }
-        }
-        
-        // Intrinsic parameters
-        var fx: Float = Float(depthWidth), fy: Float = Float(depthWidth)
-        var cx: Float = Float(depthWidth) / 2.0, cy: Float = Float(depthHeight) / 2.0
-        
-        if let calibration = depthDataConverted.cameraCalibrationData {
-            let intrinsicMatrix = calibration.intrinsicMatrix
-            let referenceSize = calibration.intrinsicMatrixReferenceDimensions
-            let scaleX = Float(depthWidth) / Float(referenceSize.width)
-            let scaleY = Float(depthHeight) / Float(referenceSize.height)
-            fx = intrinsicMatrix.columns.0.x * scaleX
-            fy = intrinsicMatrix.columns.1.y * scaleY
-            cx = intrinsicMatrix.columns.2.x * scaleX
-            cy = intrinsicMatrix.columns.2.y * scaleY
-        }
-        
-        let step = (depthWidth > 400) ? 2 : 1
-        let gridCols = depthWidth / step
-        let gridRows = depthHeight / step
-        let voxelSize = self.voxelSizeMeters
-        let maxD = self.maxDepthMeters
-        let minD = self.minDepthMeters
-        let maxEdgeDiscontinuity: Float = 0.015 // 15 mm
-        
-        var frameGridPoints = Array(repeating: Array<SIMD3<Float>?>(repeating: nil, count: gridCols), count: gridRows)
-        var frameGridKeys = Array(repeating: Array<VoxelKey?>(repeating: nil, count: gridCols), count: gridRows)
-        var frameGridColors = Array(repeating: Array<SIMD3<UInt8>>(repeating: SIMD3<UInt8>(180, 180, 180), count: gridCols), count: gridRows)
-        var newPointsBatch: [[Float]] = []
-        
-        for r in 0..<gridRows {
-            let yPixel = r * step
-            let rowOffset = yPixel * depthRowFloats
-            
-            for c in 0..<gridCols {
-                let xPixel = c * step
-                let rawZ = depthFloatBuffer[rowOffset + xPixel]
-                
-                if rawZ.isNaN || rawZ.isInfinite || rawZ < minD || rawZ > maxD { continue }
-                if let planeLimit = self.basePlaneCutoffZ, rawZ >= planeLimit { continue }
-                
-                // Sample Color at (xPixel, yPixel) from video frame
-                var vertexColor = SIMD3<UInt8>(180, 180, 180)
-                if let base = colorBaseAddress, colorWidth > 0, colorHeight > 0 {
-                    let cX = Int((Float(xPixel) / Float(depthWidth)) * Float(colorWidth))
-                    let cY = Int((Float(yPixel) / Float(depthHeight)) * Float(colorHeight))
-                    if cX >= 0 && cX < colorWidth && cY >= 0 && cY < colorHeight {
-                        let offset = cY * colorBytesPerRow + cX * 4
-                        let bPtr = base.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
-                        let byteB = bPtr[0], byteG = bPtr[1], byteR = bPtr[2]
-                        vertexColor = SIMD3<UInt8>(byteR, byteG, byteB)
+        processing = true
+        lock.unlock()
+        processingQueue.async { [weak self] in
+            guard let self = self else { return }
+            defer { self.lock.lock(); self.processing = false; self.lock.unlock() }
+            autoreleasepool {
+                guard let d = synchronizedDataCollection.synchronizedData(for: self.depthDataOutput) as? AVCaptureSynchronizedDepthData,
+                      let v = synchronizedDataCollection.synchronizedData(for: self.videoDataOutput) as? AVCaptureSynchronizedSampleBufferData,
+                      !d.depthDataWasDropped, !v.sampleBufferWasDropped,
+                      let pixel = CMSampleBufferGetImageBuffer(v.sampleBuffer) else {
+                    if self.scanActive {
+                        self.lock.lock(); self.dropped += 1; let stop = self.dropped >= 5; self.lock.unlock()
+                        if stop { DispatchQueue.main.async { self.stopScan() } }
                     }
+                    return
                 }
-                
-                // Bilateral Edge-Preserving Depth Smoothing & Anti-Spike Filter
-                var smoothedZ = rawZ
-                if c > 0 && c < gridCols - 1 && r > 0 && r < gridRows - 1 {
-                    let zL = depthFloatBuffer[rowOffset + (c - 1) * step]
-                    let zR = depthFloatBuffer[rowOffset + (c + 1) * step]
-                    let zU = depthFloatBuffer[(r - 1) * step * depthRowFloats + xPixel]
-                    let zD = depthFloatBuffer[(r + 1) * step * depthRowFloats + xPixel]
-                    
-                    let validL = !zL.isNaN && zL >= minD && zL <= maxD
-                    let validR = !zR.isNaN && zR >= minD && zR <= maxD
-                    let validU = !zU.isNaN && zU >= minD && zU <= maxD
-                    let validD = !zD.isNaN && zD >= minD && zD <= maxD
-                    
-                    // Spike rejection: isolate and suppress spurious IR reflection peaks
-                    var isSpike = false
-                    if validL && validR && abs(zL - zR) < 0.008 && abs(rawZ - (zL + zR) * 0.5) > 0.012 {
-                        smoothedZ = (zL + zR) * 0.5
-                        isSpike = true
-                    } else if validU && validD && abs(zU - zD) < 0.008 && abs(rawZ - (zU + zD) * 0.5) > 0.012 {
-                        smoothedZ = (zU + zD) * 0.5
-                        isSpike = true
-                    }
-                    
-                    // Guided bilateral smoothing across contiguous surface patches
-                    if !isSpike {
-                        var sumZ: Float = rawZ * 2.0
-                        var sumW: Float = 2.0
-                        let neighbors = [(validL, zL), (validR, zR), (validU, zU), (validD, zD)]
-                        for (valid, nZ) in neighbors {
-                            if valid && abs(rawZ - nZ) < 0.015 {
-                                sumZ += nZ
-                                sumW += 1.0
+                let timestamp = CMSampleBufferGetPresentationTimeStamp(v.sampleBuffer).seconds
+                if self.scanActive {
+                    do {
+                        guard let packet = FrameSerializer.serialize(frameID: self.frameID, timestamp: timestamp,
+                            depthData: d.depthData, colorPixelBuffer: pixel,
+                            deviceMotion: self.motionTracker.latestDeviceMotion, rawCapture: true) else {
+                            throw CocoaError(.fileWriteUnknown)
+                        }
+                        try self.recorder.append(packet)
+                        self.frameID &+= 1
+                        self.lock.lock(); let missed = self.dropped; self.lock.unlock()
+                        let total = self.recorder.count
+                        let mb = Double(self.recorder.bytes) / 1048576
+                        if total % 5 == 0 {
+                            DispatchQueue.main.async {
+                                self.capturedFrames = total; self.recordedMB = mb; self.droppedFrames = missed
+                                if missed >= 5 || ProcessInfo.processInfo.thermalState == .critical {
+                                    self.stopScan()
+                                }
                             }
                         }
-                        smoothedZ = sumZ / sumW
+                    } catch {
+                        DispatchQueue.main.async { self.stopScan() }
+                        self.report(error.localizedDescription, busy: true)
                     }
                 }
-                
-                let xM = (Float(xPixel) - cx) * smoothedZ / fx
-                let yM = (Float(yPixel) - cy) * smoothedZ / fy
-                
-                // Rigid 6DoF World Anchor Transformation:
-                // Anchors the 3D model statically in world coordinates as the camera moves around it
-                let pt = self.motionTracker.transformPointToWorld(xM: xM, yM: yM, z: smoothedZ)
-                
-                // Spatial Voxel Hash Key (in world meters)
-                guard voxelSize > 0,
-                      let vx = Int32(exactly: floor(pt.x / voxelSize)),
-                      let vy = Int32(exactly: floor(pt.y / voxelSize)),
-                      let vz = Int32(exactly: floor(pt.z / voxelSize)) else { continue }
-                let vKey = VoxelKey(x: vx, y: vy, z: vz)
-                
-                frameGridPoints[r][c] = pt
-                frameGridKeys[r][c] = vKey
-                frameGridColors[r][c] = vertexColor
-                
-                // Deduplicate Vertices
-                if self.voxelSet.count < maxLocalVertices, self.voxelSet.insert(vKey).inserted {
-                    self.accumulatedVertices.append(pt)
-                    self.accumulatedColors.append(vertexColor)
-                    newPointsBatch.append([pt.x * 1000.0, pt.y * 1000.0, pt.z * 1000.0])
-                }
-            }
-        }
-        
-        // Continuous Triangle Mesh Integration across the voxel grid
-        for r in 0..<(gridRows - 1) {
-            for c in 0..<(gridCols - 1) {
-                guard let p00 = frameGridPoints[r][c], let k00 = frameGridKeys[r][c],
-                      let p10 = frameGridPoints[r + 1][c], let k10 = frameGridKeys[r + 1][c],
-                      let p01 = frameGridPoints[r][c + 1], let k01 = frameGridKeys[r][c + 1],
-                      let p11 = frameGridPoints[r + 1][c + 1], let k11 = frameGridKeys[r + 1][c + 1] else { continue }
-                
-                let c00 = frameGridColors[r][c], c10 = frameGridColors[r + 1][c], c01 = frameGridColors[r][c + 1], c11 = frameGridColors[r + 1][c + 1]
-                
-                // Triangle 1: p00 -> p10 -> p01
-                if k00 != k10 && k10 != k01 && k01 != k00 {
-                    let triKey1 = TriangleVoxelKey(k00, k10, k01)
-                    if self.triangleSet.count < maxLocalTriangleKeys, self.triangleSet.insert(triKey1).inserted {
-                        if simd_distance(p00, p10) <= maxEdgeDiscontinuity && simd_distance(p10, p01) <= maxEdgeDiscontinuity {
-                            let normal = simd_cross(p10 - p00, p01 - p00)
-                            let len = simd_length(normal)
-                            if len > 1e-6 {
-                                self.accumulatedTriangles.append(Triangle3D(v1: p00, v2: p10, v3: p01, normal: normal / len, c1: c00, c2: c10, c3: c01))
-                            }
-                        }
+                // Five small JPEGs per second, independent of raw capture storage.
+                if timestamp - self.lastPreview >= 0.2 {
+                    self.lastPreview = timestamp
+                    let image = CIImage(cvPixelBuffer: pixel).oriented(.right)
+                    let small = image.transformed(by: CGAffineTransform(scaleX: 0.5, y: 0.5))
+                    if let cg = self.ciContext.createCGImage(small, from: small.extent) {
+                        let data = UIImage(cgImage: cg).jpegData(compressionQuality: 0.4)
+                        self.lock.lock(); self.jpeg = data; self.lock.unlock()
                     }
                 }
-                
-                // Triangle 2: p10 -> p11 -> p01
-                if k10 != k11 && k11 != k01 && k01 != k10 {
-                    let triKey2 = TriangleVoxelKey(k10, k11, k01)
-                    if self.triangleSet.count < maxLocalTriangleKeys, self.triangleSet.insert(triKey2).inserted {
-                        if simd_distance(p10, p11) <= maxEdgeDiscontinuity && simd_distance(p11, p01) <= maxEdgeDiscontinuity {
-                            let normal = simd_cross(p11 - p10, p01 - p10)
-                            let len = simd_length(normal)
-                            if len > 1e-6 {
-                                self.accumulatedTriangles.append(Triangle3D(v1: p10, v2: p11, v3: p01, normal: normal / len, c1: c10, c2: c11, c3: c01))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Telemetry Update for PC Streaming & UI
-        frameCounter += 1
-        if !newPointsBatch.isEmpty && frameCounter % 3 == 0 {
-            // Sample for network stream
-            let sampled = newPointsBatch.enumerated().compactMap { i, p in i % 2 == 0 ? p : nil }
-            if let json = try? JSONSerialization.data(withJSONObject: sampled) {
-                self.latestNewPointsJSON = json
-            }
-        }
-        
-        let totalPts = self.accumulatedVertices.count
-        let totalTris = self.accumulatedTriangles.count
-        let localFull = totalPts >= maxLocalVertices || triangleSet.count >= maxLocalTriangleKeys
-        DispatchQueue.main.async {
-            self.pointCount = totalPts
-            self.triangleCount = totalTris
-            if localFull {
-                self.statusMessage = "Vista local llena. La transmisión 3D al PC continúa."
             }
         }
     }
