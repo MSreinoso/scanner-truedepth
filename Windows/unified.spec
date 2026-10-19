@@ -27,6 +27,14 @@ for file in lock_dist.files:
 for file in lock_root.rglob('*'):
     if file.is_file() and '__pycache__' not in file.parts:
         a.datas.append((str(Path('fastrlock')/file.relative_to(lock_root)),str(file),'DATA'))
+# Compile project modules from the finalized source files, including when the
+# dependency analysis is cached. Third-party modules keep their normal cache.
+from PyInstaller.config import CONF
+from PyInstaller.building.utils import get_code_object
+project_cache=CONF['code_cache'].setdefault(id(a.pure),{})
+for module,source,kind in a.pure:
+    if source not in ('-',None) and Path(source).resolve().parent==root.resolve():
+        project_cache[module]=get_code_object(module,source,optimize=0)
 pyz=PYZ(a.pure)
 exe=EXE(pyz,a.scripts,a.binaries,a.datas,[],name='Bichito3D-Unificado-v3.2',debug=False,
         strip=False,upx=False,console=False)

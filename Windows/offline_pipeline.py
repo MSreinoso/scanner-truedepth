@@ -423,7 +423,7 @@ class StableViewer(tk.Canvas):
 class OfflineStudio:
     def __init__(self,root):
 
-        self.root=root; root.title('Bichito 3D 3.1 · Simple / Avanzado · Captura progresiva'); root.geometry('1380x900')
+        self.root=root; root.title('Bichito 3D 3.2 · Escaneo de objetos · RTX'); root.geometry('1380x900')
         self.events=queue.Queue(maxsize=100); self.cancel=threading.Event()
         self.busy,self.mesh,self.session=False,None,None
 
