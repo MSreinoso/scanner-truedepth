@@ -9,7 +9,10 @@ import sysconfig
 import numpy as np
 
 _dll_handles=[]
+_cupy=None
 def cuda_module():
+    global _cupy
+    if _cupy is not None: return _cupy
     if os.name=='nt':
         base=Path(sysconfig.get_paths()['purelib'])/'nvidia'
         for folder in ('cuda_runtime','cuda_nvrtc'):
@@ -24,6 +27,7 @@ def cuda_module():
         if runtime.is_dir(): os.environ.setdefault('CUDA_PATH',str(runtime))
     import cupy as cp
     if cp.cuda.runtime.getDeviceCount()<1: raise RuntimeError('No hay GPU CUDA disponible')
+    _cupy=cp
     return cp
 
 
