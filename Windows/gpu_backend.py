@@ -25,7 +25,7 @@ def cuda_module():
                 for builtin in directory.glob('nvrtc-builtins*.dll'):
                     _dll_handles.append(ctypes.WinDLL(str(builtin)))
         runtime=base/'cuda_runtime'
-        if runtime.is_dir(): os.environ.setdefault('CUDA_PATH',str(runtime))
+        if runtime.is_dir(): os.environ['CUDA_PATH']=str(runtime)
     import cupy as cp
     if cp.cuda.runtime.getDeviceCount()<1: raise RuntimeError('No hay GPU CUDA disponible')
     _cupy=cp
