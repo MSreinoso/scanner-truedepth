@@ -1,0 +1,12 @@
+numpy==1.26.4
+Pillow==11.3.0
+opencv-python==4.11.0.86
+open3d==0.19.0
+scikit-image==0.25.2
+websockets==15.0.1
+zstandard==0.24.0
+cupy-cuda12x==13.6.0
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cuda-nvrtc-cu12==12.9.86
+kornia==0.8.2
+kornia_rs==0.2.0

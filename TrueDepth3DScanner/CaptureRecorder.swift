@@ -17,42 +17,86 @@ final class CaptureRecorder {
         return folder
     }
 
+    private var codec = LosslessFrameCodec()
+    static let cacheLimit: UInt64 = 180_000_000
+
+    static func sealInterruptedSessions() {
+        let folders = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        for folder in folders {
+            let path = folder.appendingPathComponent("session.json")
+            guard let data = try? Data(contentsOf: path),
+                  var value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  value["finished"] as? Bool == false else { continue }
+            let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+            var frames = (value["frames"] as? NSNumber)?.intValue ?? 0
+            for file in files where file.lastPathComponent.hasSuffix(".b3dc.pending") {
+                let destination = file.deletingPathExtension()
+                if !FileManager.default.fileExists(atPath: destination.path) { try? FileManager.default.moveItem(at: file, to: destination) }
+            }
+            for file in files where file.pathExtension == "b3dc" || file.lastPathComponent.hasSuffix(".b3dc.pending") {
+                if let seq = Int(file.lastPathComponent.components(separatedBy: ".")[0]) { frames = max(frames, seq + 1) }
+            }
+            value["frames"] = frames
+            if frames == 0 && files.allSatisfy({ $0.lastPathComponent == "session.json" }) {
+                try? FileManager.default.removeItem(at: folder)
+                continue
+            }
+            value["finished"] = true
+            value["interrupted"] = true
+            if let contents = try? JSONSerialization.data(withJSONObject: value) { try? contents.write(to: path, options: .atomic) }
+        }
+    }
+
+    static func pendingBytes() -> UInt64 {
+        let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.fileSizeKey])
+        var total: UInt64 = 0
+        while let url = files?.nextObject() as? URL {
+            guard url.pathExtension == "b3dc" || url.lastPathComponent.hasSuffix(".b3dc.pending") else { continue }
+            total += UInt64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        return total
+    }
+
     func start() throws {
-        let path = Self.directory.appendingPathComponent(UUID().uuidString + ".b3draw")
-        FileManager.default.createFile(atPath: path.path, contents: Self.header)
-        file = try FileHandle(forWritingTo: path)
-        try file?.seekToEnd()
-        url = path
-        count = 0
-        bytes = 8
+        let folder = Self.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        url = folder; count = 0; bytes = 0; codec = LosslessFrameCodec()
+        try writeManifest(finished: false, dropped: 0)
+    }
+
+    private func writeManifest(finished: Bool, dropped: Int) throws {
+        guard let folder = url else { throw CocoaError(.fileWriteUnknown) }
+        let data = try JSONSerialization.data(withJSONObject: ["version": 3, "session": folder.lastPathComponent,
+            "frames": count, "dropped": dropped, "finished": finished])
+        try data.write(to: folder.appendingPathComponent("session.json"), options: .atomic)
     }
 
     func append(_ packet: Data) throws {
-        guard let file = file else { throw CocoaError(.fileWriteUnknown) }
-        if count % 15 == 0 {
-            let attrs = try FileManager.default.attributesOfFileSystem(forPath: Self.directory.path)
-            if let free = attrs[.systemFreeSize] as? NSNumber, free.uint64Value < 512 * 1024 * 1024 {
-                throw NSError(domain: "Bichito3D", code: 1, userInfo: [NSLocalizedDescriptionKey: "Espacio bajo: captura detenida y conservada."])
-            }
+        guard let folder = url else { throw CocoaError(.fileWriteUnknown) }
+        let encoded = try codec.encode(packet)
+        guard Self.pendingBytes() + UInt64(encoded.count) < Self.cacheLimit else {
+            throw NSError(domain: "Bichito3D", code: 2, userInfo: [NSLocalizedDescriptionKey: "Caché llena por desconexión. Captura detenida sin sobrescribir pendientes."])
         }
-        var size = UInt32(packet.count).littleEndian
-        try withUnsafeBytes(of: &size) { try file.write(contentsOf: Data($0)) }
-        try file.write(contentsOf: packet)
-        count += 1
-        bytes += UInt64(packet.count + 4)
+        let path = folder.appendingPathComponent(String(format: "%09d.b3dc", count))
+        let pending = path.appendingPathExtension("pending")
+        try encoded.write(to: pending, options: .atomic)
+        let handle = try FileHandle(forWritingTo: pending)
+        try handle.synchronize(); try handle.close()
+        count += 1; bytes += UInt64(encoded.count)
+        try writeManifest(finished: false, dropped: 0)
+        try FileManager.default.moveItem(at: pending, to: path)
     }
 
     func finish(dropped: Int) throws -> URL {
-        guard let file = file, let url = url else { throw CocoaError(.fileWriteUnknown) }
-        var zero: UInt32 = 0
-        try withUnsafeBytes(of: &zero) { try file.write(contentsOf: Data($0)) }
-        let metadata = try JSONSerialization.data(withJSONObject: ["frames": count, "dropped": dropped, "version": 2])
-        var size = UInt32(metadata.count).littleEndian
-        try withUnsafeBytes(of: &size) { try file.write(contentsOf: Data($0)) }
-        try file.write(contentsOf: metadata)
-        try file.synchronize()
-        try file.close()
-        self.file = nil
+        if let folder = url {
+            for file in try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) where file.lastPathComponent.hasSuffix(".b3dc.pending") {
+                let destination = file.deletingPathExtension()
+                if !FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.moveItem(at: file, to: destination) }
+                if let seq = Int(file.lastPathComponent.components(separatedBy: ".")[0]) { count = max(count, seq + 1) }
+            }
+        }
+        try writeManifest(finished: true, dropped: dropped)
+        guard let url = url else { throw CocoaError(.fileWriteUnknown) }
         return url
     }
 

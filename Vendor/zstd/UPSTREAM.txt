@@ -1,0 +1,3 @@
+facebook/zstd v1.5.7
+Commit ac66b19e6bd6b83238bf008eecc1298105298532
+BSD license selected; see LICENSE.

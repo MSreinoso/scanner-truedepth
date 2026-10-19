@@ -29,7 +29,7 @@ MAX_SESSION = 32 * 1024**3
 
 @dataclass(frozen=True)
 class Settings:
-    resolution_mm: float = 0.05
+    resolution_mm: float = 0.5
     min_depth_m: float = 0.15
     max_depth_m: float = 0.60
     registration_mm: float = 1.0
@@ -41,6 +41,9 @@ class Settings:
     stride: int = 1
     min_observations: float = 2.0
     device: str = 'Auto'
+    rgb_guidance: bool = False
+    neural_alignment: bool = False
+    tile_cells: int = 64
 
     def validate(self):
         for name,value in asdict(self).items():
@@ -53,7 +56,17 @@ class Settings:
         if not .1 <= self.min_fitness <= 1 or not .1 <= self.geometric_weight <= 1: raise ValueError('Solapamiento/peso: 0.1–1')
         if not 128 <= self.memory_mb <= 16384 or not 1 <= self.stride <= 30: raise ValueError('Memoria: 128–16384 MB; paso: 1–30')
         if not 0 <= self.min_observations <= 20 or self.device not in ('Auto','CPU','CUDA'): raise ValueError('Configuración de fusión inválida')
+        if self.tile_cells not in (16,32,64,96,128): raise ValueError('Mosaico inválido')
+        if not isinstance(self.rgb_guidance,bool) or not isinstance(self.neural_alignment,bool): raise ValueError('Opciones RGB/IA inválidas')
         return self
+
+
+PRESETS = {
+    'Escaneo Estándar': Settings(resolution_mm=.5, registration_mm=2., memory_mb=2048,rgb_guidance=True),
+    'Sketch / Vista Previa': Settings(resolution_mm=2., registration_mm=3., stride=3, min_observations=1.),
+    'Resolución Alta': Settings(resolution_mm=.2, registration_mm=1., memory_mb=2048,rgb_guidance=True),
+    'Máxima Resolución 1:1*': Settings(resolution_mm=.05, registration_mm=.5, memory_mb=2048),
+}
 
 
 def exact(source,count):
@@ -97,6 +110,9 @@ def decode_frame(packet):
 
 
 def records(path,decode=True):
+    if str(path).endswith('.b3dstream'):
+        from chunk_protocol import stream_records
+        return (yield from stream_records(path))
     with open(path,'rb') as file:
         if exact(file,8)!=HEADER: raise ValueError('Cabecera incompatible')
         count,previous_time=0,-math.inf
@@ -165,9 +181,10 @@ def relative_rotation(previous,current):
     return basis@previous@current.T@basis
 
 
-def align_cloud(current,previous,previous_imu,current_imu,settings):
+def align_cloud(current,previous,previous_imu,current_imu,settings,initial=None):
     import open3d as o3d
     transform=np.eye(4); transform[:3,:3]=relative_rotation(previous_imu,current_imu)
+    if initial is not None: transform=initial
     last=None
     for scale in (4.,2.,1.):
         voxel=settings.registration_mm*scale/1000
@@ -211,6 +228,21 @@ def prepare_frame(frame,settings):
         rgb=cv2.remap(rgb,mx,my,cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT)
     valid=np.isfinite(depth)&(depth>=settings.min_depth_m)&(depth<=settings.max_depth_m)
     safe=np.where(valid,depth,0).astype(np.float32)
+    if settings.rgb_guidance:
+        total=safe.copy(); weight=(safe>0).astype(np.float32)
+        color=rgb.astype(np.float32)
+        for dy in (-1,0,1):
+            for dx in (-1,0,1):
+                if not dx and not dy: continue
+                neighbor=np.roll(safe,(dy,dx),(0,1)); other=np.roll(color,(dy,dx),(0,1))
+                valid_neighbor=(neighbor>0)&(safe>0)
+                if dy>0: valid_neighbor[:dy]=False
+                if dy<0: valid_neighbor[dy:]=False
+                if dx>0: valid_neighbor[:,:dx]=False
+                if dx<0: valid_neighbor[:,dx:]=False
+                weights=np.exp(-((neighbor-safe)/.003)**2-np.sum((color-other)**2,axis=2)/(30**2))*valid_neighbor
+                total+=neighbor*weights;weight+=weights
+        safe=np.where(safe>0,total/np.maximum(weight,1e-8),0).astype(np.float32)
     median=cv2.medianBlur(safe,3)
     safe[np.abs(safe-median)>.01]=0
     return safe,np.ascontiguousarray(rgb)
@@ -247,9 +279,19 @@ class TensorFusion:
 
 
 def reconstruct(path,settings,progress=lambda *args:None,cancel=None):
+    settings.validate()
+    if settings.device!='CPU':
+        try:
+            from gpu_backend import cuda_module,reconstruct_tiled
+            cuda_module()
+        except ImportError:
+            if settings.device=='CUDA': raise ValueError('Abre el modo RTX para usar el runtime CUDA instalado.')
+        else:
+            return reconstruct_tiled(path,settings,progress,cancel)
     import open3d as o3d
     settings.validate(); metadata=validate_session(path); fusion=TensorFusion(settings)
     previous,previous_imu,pose=None,None,np.eye(4)
+    previous_images,previous_intrinsics=None,None
     accepted,rejected=0,0
     for index,frame in enumerate(records(path)):
         if cancel is not None and cancel.is_set(): raise InterruptedError('Reconstrucción cancelada; originales conservados')
@@ -262,12 +304,17 @@ def reconstruct(path,settings,progress=lambda *args:None,cancel=None):
         if len(cloud.points)<100: rejected+=1; continue
         valid,delta,fitness,rmse=True,np.eye(4),1.,0.
         if previous is not None:
-            try: valid,delta,fitness,rmse=align_cloud(cloud,previous,previous_imu,frame.rotation,settings)
+            initial=None
+            if settings.neural_alignment:
+                from ai_alignment import neural_seed
+                initial=neural_seed((depth,rgb),previous_images,frame.intrinsics,previous_intrinsics)
+            try: valid,delta,fitness,rmse=align_cloud(cloud,previous,previous_imu,frame.rotation,settings,initial)
             except ValueError: valid=False
         if valid:
             candidate=pose@delta
             fusion.integrate(depth,rgb,frame.intrinsics,candidate)
             pose,previous,previous_imu=candidate,cloud,frame.rotation
+            previous_images,previous_intrinsics=(depth,rgb),frame.intrinsics
             accepted+=1
         else: rejected+=1
         progress(index+1,metadata['frames'],accepted,rejected,str(fusion.device),fitness,rmse)
@@ -295,7 +342,7 @@ class UploadHandler(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header('Content-Type','application/json')
         self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw)
 
-    def do_GET(self): self.respond(200,{'service':'Bichito3D Offline','version':2})
+    def do_GET(self): self.respond(200,{'service':'Bichito3D Progressive','version':3})
 
     def do_PUT(self):
         match=re.fullmatch(r'/sessions/([A-Fa-f0-9-]{36})',self.path)
@@ -367,15 +414,18 @@ class StableViewer(tk.Canvas):
 
 class OfflineStudio:
     def __init__(self,root):
-        self.root=root; root.title('Bichito 3D 2.0 · Capturar → Transferir → Reconstruir'); root.geometry('1380x900')
+        self.root=root; root.title('Bichito 3D 3.0 · Simple / Avanzado · Captura progresiva'); root.geometry('1380x900')
         self.events=queue.Queue(maxsize=100); self.cancel=threading.Event()
         self.busy,self.mesh,self.session=False,None,None
         self.phone_active,self.phone_busy=False,False
         self.ip=tk.StringVar(); self.status=tk.StringVar(value='Conecta el iPhone. Durante captura solo se muestra vídeo ligero.')
-        self.quality=tk.DoubleVar(value=.05); self.params={}
+        self.quality=tk.DoubleVar(value=.5); self.params={}
         self.storage=Path(os.environ.get('LOCALAPPDATA',str(Path.home())))/'Bichito3D'/'Sessions'
         self.storage.mkdir(parents=True,exist_ok=True); self.build_ui()
         try:
+            from chunk_protocol import BlockServer
+            self.blocks=BlockServer(self.storage,lambda path,receipt:self.post('received',(path,receipt)))
+            self.blocks.start()
             self.server=UploadServer(('0.0.0.0',50507),self.storage,lambda path,receipt:self.post('received',(path,receipt)))
             threading.Thread(target=self.server.serve_forever,daemon=True).start()
             self.pair=PairServer(('0.0.0.0',50506),PairHandler); self.pair.callback=lambda ip:self.post('paired',ip)
@@ -403,23 +453,38 @@ class OfflineStudio:
         body=ttk.PanedWindow(self.root,orient='horizontal'); body.pack(fill='both',expand=True)
         left=ttk.Frame(body,padding=10); body.add(left,weight=1)
         self.video=tk.Label(left,text='Vista ligera del iPhone',bg='#080e19',fg='white',height=10); self.video.pack(fill='x')
-        ttk.Label(left,text='Resolución de reconstrucción (mm)').pack(anchor='w',pady=(8,0))
-        self.res_label=ttk.Label(left,text='0.050 mm'); self.res_label.pack(anchor='w')
-        ttk.Scale(left,from_=.01,to=2.,variable=self.quality,command=lambda value:self.res_label.config(text=f'{float(value):.3f} mm')).pack(fill='x')
-        defaults=Settings()
+        tabs=ttk.Notebook(left); tabs.pack(fill='both',expand=True,pady=8)
+        simple=ttk.Frame(tabs,padding=8); advanced=ttk.Frame(tabs,padding=8)
+        tabs.add(simple,text='Simple'); tabs.add(advanced,text='Avanzado')
+        self.preset_name=tk.StringVar(value='Escaneo Estándar')
+        descriptions=['Balance entre velocidad y detalle','Comprobar forma rápidamente','Más detalle en piezas intermedias','0.05 mm solicitados; procesamiento intensivo']
+        for name,description in zip(PRESETS,descriptions):
+            ttk.Radiobutton(simple,text=name,variable=self.preset_name,value=name,command=self.apply_preset).pack(anchor='w',pady=(10,2))
+            ttk.Label(simple,text=description,wraplength=320).pack(anchor='w',padx=18)
+        ttk.Label(simple,text='* 1:1 describe el muestreo de salida, no una exactitud física de 0.05 mm. Los originales no se alteran.',wraplength=330).pack(anchor='w',pady=18)
+        ttk.Label(advanced,text='Resolución de reconstrucción (mm)').pack(anchor='w',pady=(8,0))
+        self.res_label=ttk.Label(advanced,text='0.050 mm'); self.res_label.pack(anchor='w')
+        ttk.Scale(advanced,from_=.01,to=2.,variable=self.quality,command=lambda value:self.res_label.config(text=f'{float(value):.3f} mm')).pack(fill='x')
+        defaults=PRESETS['Escaneo Estándar']
         fields=[('resolution_mm','Resolución exacta (mm)'),('min_depth_m','Distancia mínima (m)'),('max_depth_m','Distancia máxima (m)'),
             ('registration_mm','Muestreo ICP (mm)'),('correspondence_mm','Correspondencia ICP (mm)'),('max_rmse_mm','Error máximo ICP (mm)'),
             ('min_fitness','Solapamiento mínimo (0–1)'),('geometric_weight','Peso geometría (resto color)'),('memory_mb','Presupuesto fusión (MB)'),
             ('stride','Usar cada N frames'),('min_observations','Observaciones mínimas')]
         for key,label in fields:
-            row=ttk.Frame(left); row.pack(fill='x',pady=1); ttk.Label(row,text=label).pack(side='left')
+            row=ttk.Frame(advanced); row.pack(fill='x',pady=1); ttk.Label(row,text=label).pack(side='left')
             variable=self.quality if key=='resolution_mm' else tk.StringVar(value=str(getattr(defaults,key)))
             self.params[key]=variable; ttk.Entry(row,textvariable=variable,width=10).pack(side='right')
         self.device=tk.StringVar(value='Auto')
-        ttk.Combobox(left,textvariable=self.device,values=['Auto','CPU','CUDA'],state='readonly',width=12).pack(anchor='e',pady=4)
-        ttk.Label(left,text='0.05 mm es tamaño de voxel, no precisión del sensor.\nEl límite de memoria detiene la fusión; no reduce calidad en silencio.',wraplength=390).pack(anchor='w',pady=8)
+        ttk.Combobox(advanced,textvariable=self.device,values=['Auto','CPU','CUDA'],state='readonly',width=12).pack(anchor='e',pady=4)
+        ttk.Label(advanced,text='La resolución no equivale a precisión del sensor.\nCUDA por mosaicos limita VRAM sin aumentar el voxel.',wraplength=390).pack(anchor='w',pady=8)
+        self.rgb_guidance=tk.BooleanVar(value=False)
+        self.neural_alignment=tk.BooleanVar(value=False)
+        ttk.Checkbutton(advanced,text='Limpieza guiada por RGB (modifica solo reconstrucción)',variable=self.rgb_guidance).pack(anchor='w')
+        ttk.Checkbutton(advanced,text='IA LoFTR para alineación (pesos locales)',variable=self.neural_alignment).pack(anchor='w')
+        self.apply_preset()
         ttk.Button(left,text='Exportar STL (mm)',command=lambda:self.export('stl')).pack(fill='x')
         ttk.Button(left,text='Exportar PLY color (mm)',command=lambda:self.export('ply')).pack(fill='x',pady=3)
+        ttk.Button(left,text='Abrir modo RTX / IA',command=self.launch_gpu).pack(fill='x',pady=3)
         right=ttk.Frame(body,padding=10); body.add(right,weight=3)
         ttk.Label(right,text='Visor fijo · arrastrar: giro manual · rueda: zoom').pack()
         ttk.Button(right,text='Restablecer vista',command=lambda:self.viewer.reset()).pack(anchor='e')
@@ -427,12 +492,34 @@ class OfflineStudio:
         self.progress=ttk.Progressbar(self.root,maximum=100); self.progress.pack(fill='x',padx=10)
         ttk.Label(self.root,textvariable=self.status,wraplength=1300,padding=10).pack(fill='x')
 
+    def apply_preset(self):
+        preset=PRESETS[self.preset_name.get()]
+        for key,var in self.params.items(): var.set(getattr(preset,key))
+        self.device.set(preset.device)
+        self.rgb_guidance.set(preset.rgb_guidance)
+        self.neural_alignment.set(preset.neural_alignment)
+        self.res_label.config(text=f'{preset.resolution_mm:.3f} mm')
+
+    def launch_gpu(self):
+        if self.busy or self.phone_active:
+            self.status.set('Finaliza la captura o reconstrucción antes de cambiar al modo RTX.'); return
+        import sys,subprocess
+        base=Path(sys.executable).parent.parent if getattr(sys,'frozen',False) else Path(__file__).parent
+        python=base/'.gpu-runtime'/'Scripts'/'python.exe'
+        entry=base/'Bichito3D_ReconstructionEngine.py'
+        if not python.exists() or not entry.exists():
+            self.status.set('El runtime RTX no está instalado junto al proyecto. Usa Instalar_GPU.bat.'); return
+        with open(base/'gpu-launch.log','a',encoding='utf-8') as log:
+            subprocess.Popen([str(python),str(entry)],cwd=base,stdout=log,stderr=log,
+                             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        self.close()
+
     def read_settings(self):
         data={key:float(var.get()) for key,var in self.params.items()}
         for name in ('memory_mb','stride'):
             if data[name]!=int(data[name]): raise ValueError(f'{name} debe ser entero')
             data[name]=int(data[name])
-        data['device']=self.device.get(); return Settings(**data).validate()
+        data['device']=self.device.get(); data['rgb_guidance']=self.rgb_guidance.get(); data['neural_alignment']=self.neural_alignment.get(); return Settings(**data).validate()
 
     def phone_request(self,path):
         ip=self.ip.get().strip()
@@ -497,7 +584,7 @@ class OfflineStudio:
         self.root.after(100,self.poll)
 
     def import_session(self):
-        path=filedialog.askopenfilename(initialdir=self.storage,filetypes=[('Sesión Bichito','*.b3draw *.b3dz')])
+        path=filedialog.askopenfilename(initialdir=self.storage,filetypes=[('Sesión Bichito','*.b3draw *.b3dz *.b3dstream')])
         if not path: return
         def worker():
             try:
@@ -530,6 +617,10 @@ class OfflineStudio:
         if self.mesh is None: return
         path=filedialog.asksaveasfilename(defaultextension='.'+extension,filetypes=[(extension.upper(),'*.'+extension)])
         if not path: return
+        if hasattr(self.mesh,'export_mm'):
+            try: self.mesh.export_mm(path); self.status.set(f'Exportado en milímetros: {path}')
+            except Exception as error: self.status.set(str(error))
+            return
         import copy,open3d as o3d
         mesh=copy.deepcopy(self.mesh); mesh.scale(1000,center=(0,0,0))
         if not o3d.io.write_triangle_mesh(path,mesh,write_ascii=False): self.status.set('No se pudo exportar')
@@ -538,6 +629,7 @@ class OfflineStudio:
     def close(self):
         self.closed=True; self.cancel.set(); self.preview_stop.set()
         if hasattr(self,'beacon'): self.beacon.stop()
+        if hasattr(self,'blocks'): threading.Thread(target=self.blocks.close,daemon=True).start()
         if hasattr(self,'server'): self.server.server_close()
         if hasattr(self,'pair'): self.pair.server_close()
         self.root.destroy()

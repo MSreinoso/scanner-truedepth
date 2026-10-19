@@ -26,6 +26,7 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let motionTracker = MotionTracker()
     private let recorder = CaptureRecorder()
+    private lazy var uploader = ChunkStreamer(address: { [weak self] in self?.streamClient.targetAddress ?? "" })
     private var scanActive = false
     private var frameID: UInt32 = 0
     private var lastPreview = -Double.infinity
@@ -42,6 +43,14 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
     override init() {
         super.init()
         streamClient.startDiscovery()
+        CaptureRecorder.sealInterruptedSessions()
+        uploader.onStatus = { [weak self] text, complete in
+            DispatchQueue.main.async {
+                self?.statusMessage = text
+                if complete && self?.isScanning == false { self?.isBusy = false }
+            }
+        }
+        uploader.start()
         checkPermissionsAndConfigure()
     }
 
@@ -150,7 +159,7 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                     self.isScanning = true
                     self.capturedFrames = 0
                     self.droppedFrames = 0
-                    self.statusMessage = "Capturando en disco. Solo vista ligera hacia Windows."
+                    self.statusMessage = "Capturando PNG + profundidad sin pérdida. Bloques hacia la caché de Windows."
                 }
             } catch { self.report(error.localizedDescription) }
         }
@@ -169,65 +178,16 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                 let url = try self.recorder.finish(dropped: lost)
                 let count = self.recorder.count
                 DispatchQueue.main.async { self.capturedFrames = count; self.droppedFrames = lost }
-                guard count > 0 else { self.report("No se obtuvieron frames TrueDepth. Revisa el sensor."); return }
-                self.report("Comprimiendo captura finalizada…", busy: true)
-                self.transferQueue.async {
-                    do {
-                        let (archive, digest) = try CaptureRecorder.compress(url)
-                        self.upload(archive, digest: digest)
-                    } catch { self.report("Captura conservada: \(error.localizedDescription)") }
-                }
+                guard count > 0 else { try? FileManager.default.removeItem(at: url); self.report("No se obtuvieron frames TrueDepth. Revisa el sensor."); return }
+                self.report("Finalizando bloques pendientes y verificando sesión en Windows…", busy: true)
+                self.uploader.start()
             } catch { self.report("Error cerrando captura: \(error.localizedDescription)") }
         }
     }
 
     func retryTransfer() {
-        guard !isBusy, !isScanning else { return }
-        isBusy = true
-        transferQueue.async { [weak self] in
-            guard let self = self else { return }
-            let files = (try? FileManager.default.contentsOfDirectory(at: CaptureRecorder.directory, includingPropertiesForKeys: nil)) ?? []
-            guard let archive = files.filter({ $0.pathExtension == "b3dz" && !FileManager.default.fileExists(atPath: $0.appendingPathExtension("received").path) }).sorted(by: { $0.path < $1.path }).first else {
-                self.report("No hay paquetes pendientes. Las capturas están en Archivos > Bichito 3D Pro > Scans.")
-                return
-            }
-            do {
-                let input = try FileHandle(forReadingFrom: archive)
-                defer { try? input.close() }
-                var hash = SHA256()
-                while let data = try input.read(upToCount: 262144), !data.isEmpty { hash.update(data: data) }
-                self.upload(archive, digest: hash.finalize().map { String(format: "%02x", $0) }.joined())
-            } catch { self.report(error.localizedDescription) }
-        }
-    }
-
-    private func upload(_ archive: URL, digest: String) {
-        let ip = streamClient.targetAddress
-        guard !ip.isEmpty, let url = URL(string: "http://\(ip):50507/sessions/\(archive.deletingPathExtension().lastPathComponent)") else {
-            report("Paquete conservado. Conecta el PC y pulsa Reintentar envío.")
-            return
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "PUT"
-        request.timeoutInterval = 1800
-        request.setValue("application/x-bichito-deflate", forHTTPHeaderField: "Content-Type")
-        request.setValue(digest, forHTTPHeaderField: "X-Content-SHA256")
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: archive.path),
-           let size = attrs[.size] as? NSNumber {
-            request.setValue(size.stringValue, forHTTPHeaderField: "Content-Length")
-        }
-        report("Enviando paquete completo a Windows…", busy: true)
-        URLSession.shared.uploadTask(with: request, fromFile: archive) { [weak self] data, response, error in
-            guard let self = self else { return }
-            guard error == nil, let http = response as? HTTPURLResponse, http.statusCode == 200,
-                  let data = data, let receipt = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  receipt["sha256"] as? String == digest else {
-                self.report("Envío pendiente: \(error?.localizedDescription ?? "Windows no confirmó el paquete"). Datos conservados.")
-                return
-            }
-            FileManager.default.createFile(atPath: archive.appendingPathExtension("received").path, contents: data)
-            self.report("Windows recibió y verificó la sesión. Reconstruye en el PC; originales conservados.")
-        }.resume()
+        uploader.start()
+        statusMessage = "Reintento automático activo; los bloques confirmados no se vuelven a enviar."
     }
 
     private func report(_ text: String, busy: Bool = false) {

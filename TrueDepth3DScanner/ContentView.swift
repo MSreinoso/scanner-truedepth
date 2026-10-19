@@ -44,12 +44,12 @@ struct ContentView: View {
                     .font(.caption.monospaced())
                 Text(capture.statusMessage).font(.caption).frame(maxWidth: .infinity, alignment: .leading)
                 if capture.isBusy { ProgressView() }
-                Button(capture.isScanning ? "FINALIZAR, COMPRIMIR Y ENVIAR" : "INICIAR CAPTURA") { capture.toggleScan() }
+                Button(capture.isScanning ? "FINALIZAR CAPTURA" : "INICIAR CAPTURA") { capture.toggleScan() }
                     .buttonStyle(.borderedProminent).tint(capture.isScanning ? .red : .blue)
                     .disabled(capture.isBusy || !capture.isSessionRunning)
                 Button("Reintentar envío pendiente") { capture.retryTransfer() }
                     .disabled(capture.isBusy || capture.isScanning)
-                Text("15 FPS RGB + TrueDepth sincronizados. Sin reconstrucción en el teléfono. Los originales se conservan en Archivos > Bichito 3D Pro > Scans.")
+                Text("PNG + profundidad Float32 sin pérdida. Caché limitada; se libera solo tras confirmar recepción en Windows. No se reconstruye en el teléfono.")
                     .font(.caption2).foregroundColor(.secondary)
             }
             .padding()
