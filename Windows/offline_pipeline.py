@@ -12,6 +12,7 @@ import shutil
 import socketserver
 import struct
 import threading
+import time
 import uuid
 import zlib
 import numpy as np
@@ -369,6 +370,7 @@ class OfflineStudio:
         self.root=root; root.title('Bichito 3D 2.0 · Capturar → Transferir → Reconstruir'); root.geometry('1380x900')
         self.events=queue.Queue(maxsize=100); self.cancel=threading.Event()
         self.busy,self.mesh,self.session=False,None,None
+        self.phone_active,self.phone_busy=False,False
         self.ip=tk.StringVar(); self.status=tk.StringVar(value='Conecta el iPhone. Durante captura solo se muestra vídeo ligero.')
         self.quality=tk.DoubleVar(value=.05); self.params={}
         self.storage=Path(os.environ.get('LOCALAPPDATA',str(Path.home())))/'Bichito3D'/'Sessions'
@@ -442,12 +444,23 @@ class OfflineStudio:
         threading.Thread(target=worker,daemon=True).start()
 
     def connect(self): self.phone_request('connect')
-    def toggle_phone(self): self.phone_request('toggle')
+    def toggle_phone(self):
+        if self.busy:
+            self.status.set('Cancela o finaliza la reconstrucción antes de iniciar otra captura.'); return
+        self.phone_request('toggle')
 
     def preview_worker(self):
+        last_status=0.
         while not self.preview_stop.wait(.2):
             ip=self.preview_ip
             if not ip: continue
+            if time.monotonic()-last_status>=1:
+                last_status=time.monotonic()
+                try:
+                    with urllib.request.urlopen(f'http://{ip}:8080/status',timeout=1) as response:
+                        status=json.loads(response.read(65536))
+                    self.post('phone_status',(bool(status.get('isScanning')),bool(status.get('busy'))))
+                except Exception: pass
             try:
                 with urllib.request.urlopen(f'http://{ip}:8080/frame.jpg',timeout=1) as response:
                     import io
@@ -464,6 +477,11 @@ class OfflineStudio:
             if kind=='preview':
                 photo=ImageTk.PhotoImage(value); self.video.configure(image=photo,text='',height=0); self.video.image=photo
             elif kind=='paired': self.ip.set(value)
+            elif kind=='phone_status':
+                self.phone_active,self.phone_busy=value
+                if self.phone_active and self.busy:
+                    self.cancel.set()
+                    self.status.set('Captura iniciada en el iPhone: cancelando reconstrucción para priorizar la captura.')
             elif kind=='received':
                 self.session,receipt=value
                 self.status.set(f'Sesión verificada: {receipt["frames"]} frames, {receipt["dropped"]} omitidos en captura. Pulsa Reconstruir.')
@@ -473,12 +491,13 @@ class OfflineStudio:
             elif kind=='result':
                 self.busy=False; self.mesh,report=value; self.viewer.set_mesh(self.mesh)
                 self.status.set(f'Modelo listo: {report["vertices"]:,} vértices, {report["triangles"]:,} triángulos · {report["device"]}')
-            elif kind=='error': self.busy=False; self.status.set(str(value))
+            elif kind=='reconstruction_error': self.busy=False; self.status.set(str(value))
+            elif kind=='error': self.status.set(str(value))
             else: self.status.set(str(value))
         self.root.after(100,self.poll)
 
     def import_session(self):
-        path=filedialog.askopenfilename(filetypes=[('Sesión Bichito','*.b3draw *.b3dz')])
+        path=filedialog.askopenfilename(initialdir=self.storage,filetypes=[('Sesión Bichito','*.b3draw *.b3dz')])
         if not path: return
         def worker():
             try:
@@ -493,6 +512,8 @@ class OfflineStudio:
 
     def start_reconstruction(self):
         if self.busy: return
+        if self.phone_active or self.phone_busy or (hasattr(self,'server') and self.server.upload_lock.locked()):
+            self.status.set('Espera a que finalice la captura, compresión y transferencia.'); return
         if self.session is None: self.status.set('Primero finaliza y transfiere una captura, o abre una sesión.'); return
         try: settings=self.read_settings()
         except (ValueError,tk.TclError) as error: self.status.set(str(error)); return
@@ -502,7 +523,7 @@ class OfflineStudio:
                 mesh,report=reconstruct(path,settings,lambda *args:self.post('progress',args),self.cancel)
                 Path(path).with_suffix('.reconstruction.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
                 self.post('result',(mesh,report))
-            except Exception as error: self.post('error',str(error))
+            except Exception as error: self.post('reconstruction_error',str(error))
         threading.Thread(target=worker,daemon=True).start()
 
     def export(self,extension):

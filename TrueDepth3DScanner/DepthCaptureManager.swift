@@ -212,6 +212,10 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
         request.timeoutInterval = 1800
         request.setValue("application/x-bichito-deflate", forHTTPHeaderField: "Content-Type")
         request.setValue(digest, forHTTPHeaderField: "X-Content-SHA256")
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: archive.path),
+           let size = attrs[.size] as? NSNumber {
+            request.setValue(size.stringValue, forHTTPHeaderField: "Content-Length")
+        }
         report("Enviando paquete completo a Windows…", busy: true)
         URLSession.shared.uploadTask(with: request, fromFile: archive) { [weak self] data, response, error in
             guard let self = self else { return }
