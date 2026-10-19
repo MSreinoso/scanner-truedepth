@@ -500,7 +500,6 @@ class OfflineStudio:
         self.neural_denoising=tk.BooleanVar(value=False)
         ttk.Checkbutton(advanced,text='Limpieza guiada por RGB (modifica solo reconstrucción)',variable=self.rgb_guidance).pack(anchor='w')
         ttk.Checkbutton(advanced,text='IA LoFTR para alineación (pesos locales)',variable=self.neural_alignment).pack(anchor='w')
-        ttk.Checkbutton(advanced,text='IA profundidad experimental (NYU; requiere modo RTX / IA)',variable=self.neural_denoising).pack(anchor='w')
 
         from model_registry import models,default
 
