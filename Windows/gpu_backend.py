@@ -16,6 +16,12 @@ def cuda_module():
     if os.name=='nt':
 
         base=Path(getattr(__import__('sys'),'_MEIPASS',sysconfig.get_paths()['purelib']))/'nvidia'
+        # CuPy registration uses cuBLAS/cuSOLVER shipped with the unified Torch
+        # runtime even when neural inference is disabled.
+        linear_algebra=base.parent/'torch'/'lib'
+        if linear_algebra.is_dir():
+            _dll_handles.append(os.add_dll_directory(str(linear_algebra)))
+            os.environ['PATH']=str(linear_algebra)+os.pathsep+os.environ.get('PATH','')
         for folder in ('cuda_runtime','cuda_nvrtc'):
             directory=base/folder/'bin'
             if directory.is_dir():
@@ -164,14 +170,14 @@ class TiledModel:
 
 
 def reconstruct_tiled(path,settings,progress,cancel):
-    from dataclasses import replace
-    import open3d as o3d
-    from offline_pipeline import validate_session,records,prepare_frame,align_cloud,TensorFusion
+    from offline_pipeline import validate_session,records,prepare_frame,relative_rotation
+    from cuda_registration import register,surface_tile_keys,unique_tiles
     metadata=validate_session(path)
     folder=Path(path).parent/(Path(path).stem+'-cuda-'+__import__('uuid').uuid4().hex[:8])
     folder.mkdir(); inputs=folder/'inputs'; inputs.mkdir()
-    coarse_settings=replace(settings,resolution_mm=max(.8,settings.resolution_mm*4),device='CPU',memory_mb=min(512,settings.memory_mb))
-    coarse=TensorFusion(coarse_settings)
+    cp=cuda_module()
+    cells=settings.tile_cells; voxel=settings.resolution_mm/1000; width=cells*voxel
+    keys=cp.empty((0,3),dtype=cp.int64)
     previous,previous_imu,pose=None,None,np.eye(4)
     previous_images,previous_intrinsics=None,None
     accepted=[]; rejected=0
@@ -179,36 +185,45 @@ def reconstruct_tiled(path,settings,progress,cancel):
         if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; sesión original conservada')
         if index%settings.stride: continue
         depth,rgb=prepare_frame(frame,settings); h,w=depth.shape; fx,fy,cx,cy=frame.intrinsics
-        rgbd=o3d.geometry.RGBDImage.create_from_color_and_depth(o3d.geometry.Image(rgb),o3d.geometry.Image(depth),depth_scale=1.,depth_trunc=settings.max_depth_m,convert_rgb_to_intensity=False)
-        intrinsic=o3d.camera.PinholeCameraIntrinsic(w,h,fx,fy,cx,cy)
-        cloud=o3d.geometry.PointCloud.create_from_rgbd_image(rgbd,intrinsic).voxel_down_sample(settings.registration_mm/1000)
-        valid,delta,fitness,rmse=len(cloud.points)>=100,np.eye(4),1.,0.
+        cloud=cp.asarray(depth)
+        valid,delta,fitness,rmse=int(cp.count_nonzero(cloud))>=100,np.eye(4),1.,0.
         if valid and previous is not None:
-            initial=None
+            initial=np.eye(4); initial[:3,:3]=relative_rotation(previous_imu,frame.rotation)
             if settings.neural_alignment:
                 from ai_alignment import neural_seed
                 initial=neural_seed((depth,rgb),previous_images,frame.intrinsics,previous_intrinsics)
-            try: valid,delta,fitness,rmse=align_cloud(cloud,previous,previous_imu,frame.rotation,settings,initial)
+            try: valid,delta,fitness,rmse=register(cloud,previous,frame.intrinsics,previous_intrinsics,initial,settings)
             except ValueError: valid=False
         if valid:
             candidate=pose@delta
-            coarse.integrate(depth,rgb,frame.intrinsics,candidate)
+            frame_keys=surface_tile_keys(cloud,frame.intrinsics,candidate,width)
+            keys=unique_tiles(cp.concatenate((keys,frame_keys)))
             pose,previous,previous_imu=candidate,cloud,frame.rotation
             previous_images,previous_intrinsics=(depth,rgb),frame.intrinsics
             name=f'{index:09d}'
             np.save(inputs/(name+'-depth.npy'),depth);np.save(inputs/(name+'-rgb.npy'),rgb)
             accepted.append((name,pose.copy(),frame.intrinsics.copy()))
         else: rejected+=1
-        progress(index+1,metadata['frames'],len(accepted),rejected,'CPU: alineación global',fitness,rmse)
+        progress(index+1,metadata['frames'],len(accepted),rejected,'CUDA: alineación y localización de superficie',fitness,rmse)
     if len(accepted)<2: raise ValueError('Pocos frames alineados para reconstruir')
-    points=np.asarray(coarse.grid.cpu().extract_point_cloud(weight_threshold=max(1.,settings.min_observations)).to_legacy().points)
-    if len(points)==0: raise ValueError('No se obtuvo superficie global consistente')
-    cells=settings.tile_cells; voxel=settings.resolution_mm/1000; width=cells*voxel
-    keys=np.unique(np.floor(points/width).astype(np.int64),axis=0)
-    # Cover the coarse localization error without changing final voxel spacing.
-    keys=np.unique(np.concatenate([keys+[x,y,z] for x in (-1,0,1) for y in (-1,0,1) for z in (-1,0,1)]),axis=0)
-    del coarse,points
-    cp=cuda_module(); total=0; samples=[]; sample_colors=[]
+    if len(keys)==0: raise ValueError('No se obtuvo superficie global consistente')
+    keys=unique_tiles(cp.concatenate([keys+cp.asarray([x,y,z]) for x in (-1,0,1) for y in (-1,0,1) for z in (-1,0,1)]))
+    keys=cp.asnumpy(keys)
+    total=0; samples=[]; sample_colors=[]
+    from collections import OrderedDict
+    cache=OrderedDict();cache_bytes=0
+    cache_limit=min(settings.memory_mb*1024**2//2,cp.cuda.runtime.memGetInfo()[0]//4)
+    def prepared(name):
+        nonlocal cache_bytes
+        if name in cache:
+            cache.move_to_end(name);return cache[name]
+        depth=np.load(inputs/(name+'-depth.npy'));rgb=np.load(inputs/(name+'-rgb.npy'))
+        size=depth.nbytes+rgb.nbytes
+        while cache and cache_bytes+size>cache_limit:
+            _,old=cache.popitem(last=False);cache_bytes-=old[0].nbytes+old[1].nbytes
+        value=(depth,rgb,cp.asarray(depth),cp.asarray(rgb))
+        cache[name]=value;cache_bytes+=size
+        return value
     for tile_index,key in enumerate(keys):
         if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; mosaicos terminados y originales conservados')
         origin=key.astype(np.float64)*width; center=origin+width/2; radius=math.sqrt(3)*width/2+.004
@@ -216,30 +231,32 @@ def reconstruct_tiled(path,settings,progress,cancel):
         for name,pose,intrinsics in accepted:
             point=np.linalg.inv(pose)@np.r_[center,1.]
             if point[2]<=0: continue
-            depth=np.load(inputs/(name+'-depth.npy')); h,w=depth.shape; fx,fy,cx,cy=intrinsics
+            depth,rgb,gpu_depth,gpu_rgb=prepared(name); h,w=depth.shape; fx,fy,cx,cy=intrinsics
             u,v=fx*point[0]/point[2]+cx,fy*point[1]/point[2]+cy
             margin=max(fx,fy)*radius/point[2]
             if u+margin<0 or v+margin<0 or u-margin>=w or v-margin>=h: continue
             crop=depth[max(0,int(v-margin)):min(h,int(v+margin)+2),max(0,int(u-margin)):min(w,int(u+margin)+2)]
             valid=crop[crop>0]
             if len(valid)==0 or valid.min()>point[2]+radius or valid.max()<point[2]-radius: continue
-            rgb=np.load(inputs/(name+'-rgb.npy'))
-            tile.integrate(depth,rgb,intrinsics,pose)
+            tile.integrate(gpu_depth,gpu_rgb,intrinsics,pose)
         vertices,colors=tile.mesh(max(1.,settings.min_observations))
         if len(vertices):
-            np.savez_compressed(folder/f'tile-{tile_index:08d}.npz',vertices=vertices,colors=colors)
+            np.savez(folder/f'tile-{tile_index:08d}.npz',vertices=vertices,colors=colors)
             total+=len(vertices)
             flat=vertices.reshape(-1,3); cflat=colors.reshape(-1,3)
             step=max(1,len(flat)//30);samples.append(flat[::step][:30]);sample_colors.append(cflat[::step][:30])
             # Preview alone is bounded; full triangles stay in tile files.
             if sum(len(v) for v in samples)>12000:
                 combined=np.concatenate(samples)[::2]; cc=np.concatenate(sample_colors)[::2];samples=[combined];sample_colors=[cc]
-        del tile; cp.get_default_memory_pool().free_all_blocks()
+        del tile
         progress(tile_index+1,len(keys),len(accepted),rejected,f'CUDA mosaico {tile_index+1}/{len(keys)}',1.,0.)
     if total==0: raise ValueError('No se obtuvo malla fina consistente')
     np.savez_compressed(folder/'preview.npz',vertices=np.concatenate(samples),colors=np.concatenate(sample_colors))
     report={'settings':__import__('dataclasses').asdict(settings),'captured':metadata,'accepted':len(accepted),'rejected':rejected,
-            'device':'CUDA: CuPy TSDF + Marching Cubes','vertices':total*3,'triangles':total,'tiles':len(keys),'folder':str(folder)}
+            'device':'CUDA: ICP + localización + TSDF + Marching Cubes',
+            'gpu_name':cp.cuda.runtime.getDeviceProperties(0)['name'].decode(),
+            'cpu_tasks':['decodificación, rectificación RGB-D y E/S'],
+            'registration':'CUDA projective point-to-plane coarse-to-fine','vertices':total*3,'triangles':total,'tiles':len(keys),'folder':str(folder)}
     (folder/'model.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     # Prepared images are a reconstructible PC cache, never the source session.
     import shutil

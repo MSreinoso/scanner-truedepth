@@ -63,12 +63,15 @@ struct ContentView: View {
                     DispatchQueue.main.sync {
                         let value: [String: Any] = ["isScanning": capture.isScanning,
                             "busy": capture.isBusy, "frames": capture.capturedFrames,
-                            "dropped": capture.droppedFrames, "status": capture.statusMessage]
+                            "dropped": capture.droppedFrames, "status": capture.statusMessage,
+                            "captureError": capture.captureError]
                         let data = (try? JSONSerialization.data(withJSONObject: value)) ?? Data("{}".utf8)
                         return String(data: data, encoding: .utf8) ?? "{}"
                     }
                 }
                 server.onToggleScan = { capture.toggleScan() }
+                server.onStartScan = { capture.startScan() }
+                server.onStopScan = { capture.stopScan() }
                 volume.onTriggerAction = { capture.toggleScan() }
                 server.start()
             }

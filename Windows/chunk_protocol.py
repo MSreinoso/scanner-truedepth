@@ -13,6 +13,7 @@ import zstandard as zstd
 
 MAGIC_PNG = 0xB1C01703
 MAGIC_REPEAT = 0xB1C01704
+MAGIC_BGRA = 0xB1C01705
 MAX_BLOCK = 8 * 1024 * 1024
 
 
@@ -28,14 +29,18 @@ def decode_lossless_packet(packet, previous=None):
     meta_start=rgb_header+8+png_size
     meta_size=struct.unpack_from('<I',packet,meta_start)[0]
     if meta_size>262144 or meta_start+4+meta_size!=len(packet): raise ValueError('Calibración incompleta')
-    if magic==MAGIC_PNG:
+    if magic in (MAGIC_PNG,MAGIC_BGRA):
         raw=zstd.ZstdDecompressor().decompress(packet[88:rgb_header],max_output_size=dw*dh*4)
         if len(raw)!=dw*dh*4: raise ValueError('Profundidad Zstd inválida')
         depth=np.frombuffer(raw,np.uint8).reshape(4,-1).T.copy().tobytes()
-        with Image.open(io.BytesIO(packet[rgb_header+8:meta_start])) as image:
-            if image.size!=(rw,rh) or image.format!='PNG' or image.mode not in ('RGB','RGBA'): raise ValueError('PNG inválido')
-            rgba=np.asarray(image.convert('RGBA'))
-            rgb=rgba[:,:,[2,1,0,3]].copy().tobytes()
+        if magic==MAGIC_BGRA:
+            rgb=zstd.ZstdDecompressor().decompress(packet[rgb_header+8:meta_start],max_output_size=rw*rh*4)
+            if len(rgb)!=rw*rh*4: raise ValueError('BGRA Zstd inválido')
+        else:
+            with Image.open(io.BytesIO(packet[rgb_header+8:meta_start])) as image:
+                if image.size!=(rw,rh) or image.format!='PNG' or image.mode not in ('RGB','RGBA'): raise ValueError('PNG inválido')
+                rgba=np.asarray(image.convert('RGBA'))
+                rgb=rgba[:,:,[2,1,0,3]].copy().tobytes()
     elif magic==MAGIC_REPEAT:
         if previous is None or depth_size!=0 or png_size!=0: raise ValueError('Referencia redundante inválida')
         prev_depth=struct.unpack_from('<I',previous,84)[0]
@@ -80,7 +85,7 @@ class BlockStore:
         # Exact repeats share pixels with the nearest preceding full block.
         while seq>=0:
             packet=(folder/f'{seq:09d}.b3dc').read_bytes()
-            if struct.unpack_from('<I',packet)[0]==MAGIC_PNG:
+            if struct.unpack_from('<I',packet)[0] in (MAGIC_PNG,MAGIC_BGRA):
                 return decode_lossless_packet(packet)
             seq-=1
         raise ValueError('Falta keyframe de referencia')

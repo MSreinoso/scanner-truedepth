@@ -16,6 +16,7 @@ final class LosslessFrameCodec {
         var identity = Data(packet[88..<rgbHeader]); identity.append(packet[rgbStart..<metadataStart])
         let repeated = previousPixels == identity
         var depth = Data(), png = Data()
+        var rawBGRA = false
         if !repeated {
             // Byte shuffle is reversible, including NaN payloads and signed zero.
             var shuffled = Data(count: depthSize)
@@ -33,10 +34,21 @@ final class LosslessFrameCodec {
             guard ZSTD_isError(encoded) == 0 else { throw CocoaError(.fileWriteUnknown) }
             depth.count = encoded
             let pixels = Data(packet[rgbStart..<metadataStart])
-            guard pixels.withUnsafeBytes({ bytes in
+            let opaque = pixels.withUnsafeBytes({ bytes in
                 let values = bytes.bindMemory(to: UInt8.self)
                 return stride(from: 3, to: values.count, by: 4).allSatisfy { values[$0] == 255 }
-            }) else { throw CocoaError(.fileReadCorruptFile) }
+            })
+            if !opaque {
+                // Some camera buffers carry unused/non-opaque alpha bytes. Never
+                // reject a valid sensor frame or premultiply its RGB channels.
+                rawBGRA = true
+                png = Data(count: ZSTD_compressBound(pixels.count))
+                let size = png.withUnsafeMutableBytes { dst in
+                    pixels.withUnsafeBytes { src in ZSTD_compress(dst.baseAddress, dst.count, src.baseAddress, src.count, 1) }
+                }
+                guard ZSTD_isError(size) == 0 else { throw CocoaError(.fileWriteUnknown) }
+                png.count = size
+            } else {
             guard let provider = CGDataProvider(data: pixels as CFData),
                   let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
                     space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue).union(.byteOrder32Little),
@@ -46,6 +58,7 @@ final class LosslessFrameCodec {
             CGImageDestinationAddImage(destination, image, nil)
             guard CGImageDestinationFinalize(destination) else { throw CocoaError(.fileWriteUnknown) }
             png = output as Data
+            }
         }
         previousPixels = identity
         var header = Data(packet.prefix(88))
@@ -53,7 +66,7 @@ final class LosslessFrameCodec {
             var le = value.littleEndian
             withUnsafeBytes(of: &le) { header.replaceSubrange(offset..<offset+4, with: $0) }
         }
-        set(repeated ? 0xB1C01704 : 0xB1C01703, at: 0)
+        set(repeated ? 0xB1C01704 : (rawBGRA ? 0xB1C01705 : 0xB1C01703), at: 0)
         set(UInt32(depth.count), at: 84)
         var result = header; result.append(depth)
         result.append(packet[rgbHeader..<rgbHeader+4])

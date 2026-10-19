@@ -28,5 +28,5 @@ for file in lock_root.rglob('*'):
     if file.is_file() and '__pycache__' not in file.parts:
         a.datas.append((str(Path('fastrlock')/file.relative_to(lock_root)),str(file),'DATA'))
 pyz=PYZ(a.pure)
-exe=EXE(pyz,a.scripts,a.binaries,a.datas,[],name='Bichito3D-Unificado-v3.1',debug=False,
+exe=EXE(pyz,a.scripts,a.binaries,a.datas,[],name='Bichito3D-Unificado-v3.2',debug=False,
         strip=False,upx=False,console=False)

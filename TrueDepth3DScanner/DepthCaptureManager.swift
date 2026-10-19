@@ -14,6 +14,7 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
     @Published var droppedFrames = 0
     @Published var recordedMB = 0.0
     @Published var statusMessage = "Iniciando TrueDepth…"
+    @Published var captureError = ""
     let captureSession = AVCaptureSession()
     let streamClient = BinaryStreamClient()
     private let sessionQueue = DispatchQueue(label: "com.bichito.session")
@@ -46,7 +47,7 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
         CaptureRecorder.sealInterruptedSessions()
         uploader.onStatus = { [weak self] text, complete in
             DispatchQueue.main.async {
-                self?.statusMessage = text
+                if self?.isScanning == false && self?.captureError.isEmpty == true { self?.statusMessage = text }
                 if complete && self?.isScanning == false { self?.isBusy = false }
             }
         }
@@ -145,6 +146,7 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
 
     func startScan() {
         guard isSessionRunning, !isBusy, !isScanning else { return }
+        captureError = ""
         isBusy = true
         processingQueue.async { [weak self] in
             guard let self = self else { return }
@@ -161,12 +163,17 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                     self.droppedFrames = 0
                     self.statusMessage = "Capturando PNG + profundidad sin pérdida. Bloques hacia la caché de Windows."
                 }
-            } catch { self.report(error.localizedDescription) }
+            } catch {
+                DispatchQueue.main.async { self.captureError = error.localizedDescription }
+                self.report("No se pudo iniciar: \(error.localizedDescription)")
+            }
         }
     }
 
-    func stopScan() {
+    func stopScan(reason: String? = nil) {
         guard isScanning, !isBusy else { return }
+        if let reason = reason { captureError = reason }
+        let failure = captureError
         isScanning = false
         isBusy = true
         processingQueue.async { [weak self] in
@@ -178,8 +185,8 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                 let url = try self.recorder.finish(dropped: lost)
                 let count = self.recorder.count
                 DispatchQueue.main.async { self.capturedFrames = count; self.droppedFrames = lost }
-                guard count > 0 else { try? FileManager.default.removeItem(at: url); self.report("No se obtuvieron frames TrueDepth. Revisa el sensor."); return }
-                self.report("Finalizando bloques pendientes y verificando sesión en Windows…", busy: true)
+                guard count > 0 else { try? FileManager.default.removeItem(at: url); self.report(failure.isEmpty ? "No se obtuvieron frames TrueDepth. Revisa el sensor." : failure); return }
+                self.report(failure.isEmpty ? "Finalizando bloques pendientes y verificando sesión en Windows…" : failure, busy: failure.isEmpty)
                 self.uploader.start()
             } catch { self.report("Error cerrando captura: \(error.localizedDescription)") }
         }
@@ -243,14 +250,14 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                             DispatchQueue.main.async {
                                 self.capturedFrames = total; self.recordedMB = mb; self.droppedFrames = missed
                                 if ProcessInfo.processInfo.thermalState == .critical {
-                                    self.stopScan()
+                                    self.stopScan(reason: "Captura detenida: temperatura crítica. Los fotogramas capturados se conservan.")
                                 }
                             }
                         }
                     } catch {
                         DispatchQueue.main.async {
-                            self.stopScan()
-                            self.statusMessage = error.localizedDescription
+                            let failure = error as NSError
+                            self.stopScan(reason: "Frame \(self.recorder.count): \(failure.domain) / \(failure.code) · \(failure.localizedDescription)")
                         }
                     }
                 }

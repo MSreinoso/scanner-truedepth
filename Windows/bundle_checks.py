@@ -15,6 +15,11 @@ def run(destination):
         vertices,_=tile.mesh(2);assert len(vertices)>0
         np.testing.assert_allclose(vertices[:,:,2],.3,atol=1e-6)
         result['cuda_triangles']=len(vertices)
+        from cuda_registration import register
+        from offline_pipeline import Settings
+        ok,pose,fitness,rmse=register(depth+.001,depth,[120,120,16,16],[120,120,16,16],np.eye(4),Settings())
+        assert ok and abs(pose[2,3]+.001)<1e-5
+        result['cuda_registration']={'fitness':fitness,'rmse':rmse,'translation':pose[:3,3].tolist()}
         output=DepthDenoiser().denoise(depth,rgb);assert np.isfinite(output).all()
         matcher=NeuralMatcher();result['loftr_device']=matcher.device
         import tkinter as tk,threading

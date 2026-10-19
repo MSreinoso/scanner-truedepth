@@ -14,6 +14,20 @@ except ImportError:
 
 @unittest.skipUnless(GPU,'CUDA runtime optional; tested separately on RTX 5060')
 class CudaTests(unittest.TestCase):
+    def test_cuda_registration_recovers_plane_translation_and_rejects_empty(self):
+        from cuda_registration import register,surface_tile_keys
+        from offline_pipeline import Settings
+        cp=cuda_module();settings=Settings()
+        target=np.full((80,80),.3,np.float32)
+        source=target+.001
+        valid,pose,fitness,rmse=register(source,target,[200,200,40,40],[200,200,40,40],np.eye(4),settings)
+        self.assertTrue(valid);self.assertGreater(fitness,.8)
+        self.assertAlmostEqual(pose[2,3],-.001,places=5)
+        self.assertLess(rmse,.001)
+        keys=surface_tile_keys(source,[200,200,40,40],pose,.0032)
+        self.assertIsInstance(keys,cp.ndarray);self.assertGreater(len(keys),0)
+        with self.assertRaises(ValueError):register(np.zeros_like(source),target,[200,200,40,40],[200,200,40,40],np.eye(4),settings)
+
     def test_cuda_initialization_is_idempotent(self):
         first=cuda_module();path=os.environ.get('PATH','')
         for _ in range(500):self.assertIs(cuda_module(),first)

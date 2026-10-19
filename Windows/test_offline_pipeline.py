@@ -92,7 +92,7 @@ class SessionTests(unittest.TestCase):
 
     def test_settings_default_and_reject_nonfinite(self):
         from offline_pipeline import PRESETS
-        self.assertEqual(Settings().validate().resolution_mm,.5)
+        self.assertEqual(Settings().validate().resolution_mm,.05)
         self.assertEqual(list(PRESETS.values())[-1].resolution_mm,.05)
         for kwargs in ({'resolution_mm':float('nan')},{'stride':0},{'memory_mb':0},{'min_depth_m':.8},{'device':'fake'}):
             with self.assertRaises(ValueError): Settings(**kwargs).validate()

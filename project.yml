@@ -26,8 +26,8 @@ targets:
       path: TrueDepth3DScanner/Info.plist
       properties:
         CFBundleDisplayName: "Bichito 3D Pro"
-        CFBundleShortVersionString: "3.1"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "3.2"
+        CFBundleVersion: "6"
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         NSAppTransportSecurity:

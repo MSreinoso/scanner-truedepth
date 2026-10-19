@@ -35,3 +35,17 @@ for id in 0..<2 {
     try raw.write(to: folder.appendingPathComponent("frame\(id).raw"))
     try encoded.write(to: folder.appendingPathComponent("frame\(id).b3dc"))
 }
+// Camera BGRA may contain zero/unused alpha. It must remain byte-exact and
+// must not cancel capture on its first frame.
+var nonOpaque = frame(2)
+let rgbStart = 88 + 16 + 8
+for index in 0..<4 { nonOpaque[rgbStart + index * 4 + 3] = UInt8(index * 32) }
+let encodedNonOpaque = try codec.encode(nonOpaque)
+try nonOpaque.write(to: folder.appendingPathComponent("frame2.raw"))
+try encodedNonOpaque.write(to: folder.appendingPathComponent("frame2.b3dc"))
+let recorder = CaptureRecorder()
+try recorder.start()
+try recorder.append(nonOpaque)
+precondition(recorder.count == 1)
+let recorded = try recorder.finish(dropped: 0)
+try FileManager.default.removeItem(at: recorded)

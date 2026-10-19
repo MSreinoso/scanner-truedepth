@@ -17,6 +17,8 @@ class WebStreamServer: ObservableObject {
     var getLatestNewPoints: (() -> Data?)?
     var getStatusJSON: (() -> String)?
     var onToggleScan: (() -> Void)?
+    var onStartScan: (() -> Void)?
+    var onStopScan: (() -> Void)?
     var onConnectToPC: ((String) -> Void)?
     var onClearScan: (() -> Void)?
     var onTriggerShareOnPhone: (() -> Void)?
@@ -75,6 +77,11 @@ class WebStreamServer: ObservableObject {
                 } else {
                     self.sendResponse(connection: connection, status: "204 No Content", contentType: "text/plain", body: Data())
                 }
+            } else if path == "/start" || path == "/stop" {
+                DispatchQueue.main.async {
+                    if path == "/start" { self.onStartScan?() } else { self.onStopScan?() }
+                }
+                self.sendResponse(connection: connection, status: "202 Accepted", contentType: "application/json", body: Data("{\"accepted\":true}".utf8))
             } else if path.hasPrefix("/toggle") {
                 DispatchQueue.main.async {
                     self.onToggleScan?()

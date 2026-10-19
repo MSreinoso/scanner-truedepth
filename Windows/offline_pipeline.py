@@ -29,7 +29,7 @@ MAX_SESSION = 32 * 1024**3
 
 @dataclass(frozen=True)
 class Settings:
-    resolution_mm: float = 0.5
+    resolution_mm: float = 0.05
     min_depth_m: float = 0.15
     max_depth_m: float = 0.60
     registration_mm: float = 1.0
@@ -430,7 +430,7 @@ class OfflineStudio:
         self.results={}
         self.phone_active,self.phone_busy=False,False
         self.ip=tk.StringVar(); self.status=tk.StringVar(value='Conecta el iPhone. Durante captura solo se muestra vídeo ligero.')
-        self.quality=tk.DoubleVar(value=.5); self.params={}
+        self.quality=tk.DoubleVar(value=.05); self.params={}
         self.storage=Path(os.environ.get('LOCALAPPDATA',str(Path.home())))/'Bichito3D'/'Sessions'
         self.storage.mkdir(parents=True,exist_ok=True); self.build_ui()
         try:
@@ -456,90 +456,116 @@ class OfflineStudio:
             if kind not in ('preview','progress'): self.events.put((kind,value),timeout=10)
 
     def build_ui(self):
+        self.root.minsize(680,520)
         top=ttk.Frame(self.root,padding=10); top.pack(fill='x')
-        ttk.Label(top,text='IP iPhone').pack(side='left'); ttk.Entry(top,textvariable=self.ip,width=18).pack(side='left',padx=6)
-        for text,command in [('Conectar',self.connect),('Iniciar/finalizar captura',self.toggle_phone),
-            ('Abrir sesión',self.import_session),('Reconstruir / aplicar parámetros',self.start_reconstruction),('Cancelar procesado',self.cancel.set)]:
-            ttk.Button(top,text=text,command=command).pack(side='left',padx=3)
-        body=ttk.PanedWindow(self.root,orient='horizontal'); body.pack(fill='both',expand=True)
-        left=ttk.Frame(body,padding=10); body.add(left,weight=1)
-        self.video=tk.Label(left,text='Vista ligera del iPhone',bg='#080e19',fg='white',height=10); self.video.pack(fill='x')
-        tabs=ttk.Notebook(left); tabs.pack(fill='both',expand=True,pady=8)
-        simple=ttk.Frame(tabs,padding=8); advanced=ttk.Frame(tabs,padding=8)
-        tabs.add(simple,text='Simple'); tabs.add(advanced,text='Avanzado')
-        panel=advanced; canvas=tk.Canvas(panel,height=360,highlightthickness=0)
-        scrollbar=ttk.Scrollbar(panel,orient='vertical',command=canvas.yview)
-        scrollbar.pack(side='right',fill='y');canvas.pack(side='left',fill='both',expand=True)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        advanced=ttk.Frame(canvas);window=canvas.create_window((0,0),window=advanced,anchor='nw')
-        advanced.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>',lambda event:canvas.itemconfigure(window,width=event.width))
-        self.preset_name=tk.StringVar(value='Escaneo Estándar')
-        descriptions=['Balance entre velocidad y detalle','Comprobar forma rápidamente','Más detalle en piezas intermedias','0.05 mm solicitados; procesamiento intensivo']
-        for name,description in zip(PRESETS,descriptions):
-            ttk.Radiobutton(simple,text=name,variable=self.preset_name,value=name,command=self.apply_preset).pack(anchor='w',pady=(10,2))
-            ttk.Label(simple,text=description,wraplength=320).pack(anchor='w',padx=18)
-        ttk.Label(simple,text='* 1:1 describe el muestreo de salida, no una exactitud física de 0.05 mm. Los originales no se alteran.',wraplength=330).pack(anchor='w',pady=18)
-        ttk.Label(advanced,text='Resolución de reconstrucción (mm)').pack(anchor='w',pady=(8,0))
-        self.res_label=ttk.Label(advanced,text='0.050 mm'); self.res_label.pack(anchor='w')
-        ttk.Scale(advanced,from_=.01,to=2.,variable=self.quality,command=lambda value:self.res_label.config(text=f'{float(value):.3f} mm')).pack(fill='x')
-        defaults=PRESETS['Escaneo Estándar']
+        top.columnconfigure(1,weight=1)
+        ttk.Label(top,text='1 · Conectar iPhone').grid(row=0,column=0,sticky='w',padx=(0,8))
+        ttk.Entry(top,textvariable=self.ip).grid(row=0,column=1,sticky='ew')
+        ttk.Button(top,text='Conectar',command=self.connect).grid(row=0,column=2,padx=(8,0))
+        actions=ttk.Frame(top);actions.grid(row=1,column=0,columnspan=3,sticky='ew',pady=(8,0))
+        self.capture_button=ttk.Button(actions,text='Iniciar captura',command=self.toggle_phone)
+        self.stop_button=ttk.Button(actions,text='Finalizar captura',command=lambda:self.phone_request('stop'))
+        buttons=[self.capture_button,self.stop_button,
+                 ttk.Button(actions,text='Abrir sesión',command=self.import_session),
+                 ttk.Button(actions,text='Reconstruir',command=self.start_reconstruction),
+                 ttk.Button(actions,text='Cancelar procesado',command=self.cancel.set)]
+        body=ttk.Frame(self.root,padding=(10,0));body.pack(fill='both',expand=True)
+        body.rowconfigure(0,weight=1);body.columnconfigure(1,weight=1)
+        controls=ttk.Frame(body,width=350);controls.grid(row=0,column=0,sticky='nsew',padx=(0,10))
+        tabs=ttk.Notebook(controls);tabs.pack(fill='both',expand=True)
+        wrap_labels=[]
+        def page(title):
+            panel=ttk.Frame(tabs);tabs.add(panel,text=title)
+            canvas=tk.Canvas(panel,width=335,highlightthickness=0)
+            scrollbar=ttk.Scrollbar(panel,orient='vertical',command=canvas.yview)
+            scrollbar.pack(side='right',fill='y');canvas.pack(side='left',fill='both',expand=True)
+            canvas.configure(yscrollcommand=scrollbar.set)
+            frame=ttk.Frame(canvas,padding=10);window=canvas.create_window((0,0),window=frame,anchor='nw')
+            frame.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
+            canvas.bind('<Configure>',lambda event:canvas.itemconfigure(window,width=event.width))
+            def wheel(event):canvas.yview_scroll(-int(event.delta/120),'units')
+            canvas.bind('<MouseWheel>',wheel)
+            return frame
+        simple=page('Calidad');advanced=page('Avanzado');capture=page('Cámara')
+        def label(parent,text):
+            item=ttk.Label(parent,text=text,wraplength=300);item.pack(fill='x',pady=4);wrap_labels.append(item);return item
+        label(simple,'2 · Calidad para objetos generales')
+        self.preset_name=tk.StringVar(value='Máxima Resolución 1:1*')
+        for name in PRESETS:
+            ttk.Radiobutton(simple,text=name,variable=self.preset_name,value=name,command=self.apply_preset).pack(anchor='w',pady=5)
+        label(simple,'0,05 mm es el tamaño de muestreo de la reconstrucción. La precisión física depende del sensor y la captura.')
+        label(simple,'3 · Reconstrucción en la GPU RTX')
+        self.reconstruction_mode=tk.StringVar(value='RTX sola')
+        ttk.Combobox(simple,textvariable=self.reconstruction_mode,values=['RTX sola','RTX + IA','Comparar ambas'],state='readonly',width=1).pack(fill='x',pady=4)
+        label(simple,'Comparar ambas conserva dos modelos para elegir cuál exportar.')
+        label(simple,'4 · Resultado a visualizar y exportar')
+        self.result_choice=tk.StringVar()
+        self.result_combo=ttk.Combobox(simple,textvariable=self.result_choice,state='readonly',width=1)
+        self.result_combo.pack(fill='x',pady=4);self.result_combo.bind('<<ComboboxSelected>>',self.select_result)
+        ttk.Button(simple,text='Exportar STL (mm)',command=lambda:self.export('stl')).pack(fill='x',pady=4)
+        ttk.Button(simple,text='Exportar PLY con color (mm)',command=lambda:self.export('ply')).pack(fill='x',pady=4)
+        label(advanced,'Resolución de reconstrucción (mm)')
+        self.res_label=label(advanced,'0.050 mm')
+        ttk.Scale(advanced,from_=.05,to=2.,variable=self.quality,command=lambda value:self.res_label.config(text=f'{float(value):.3f} mm')).pack(fill='x')
+        defaults=PRESETS['Máxima Resolución 1:1*']
         fields=[('resolution_mm','Resolución exacta (mm)'),('min_depth_m','Distancia mínima (m)'),('max_depth_m','Distancia máxima (m)'),
             ('registration_mm','Muestreo ICP (mm)'),('correspondence_mm','Correspondencia ICP (mm)'),('max_rmse_mm','Error máximo ICP (mm)'),
-            ('min_fitness','Solapamiento mínimo (0–1)'),('geometric_weight','Peso geometría (resto color)'),('memory_mb','Presupuesto fusión (MB)'),
+            ('min_fitness','Solapamiento mínimo (0–1)'),('memory_mb','Presupuesto de memoria (MB)'),
             ('stride','Usar cada N frames'),('min_observations','Observaciones mínimas')]
-        for key,label in fields:
-            row=ttk.Frame(advanced); row.pack(fill='x',pady=1); ttk.Label(row,text=label).pack(side='left')
+        for key,text in fields:
+            label(advanced,text)
             variable=self.quality if key=='resolution_mm' else tk.StringVar(value=str(getattr(defaults,key)))
-            self.params[key]=variable; ttk.Entry(row,textvariable=variable,width=10).pack(side='right')
-        self.device=tk.StringVar(value='Auto')
-        ttk.Combobox(advanced,textvariable=self.device,values=['Auto','CPU','CUDA'],state='readonly',width=12).pack(anchor='e',pady=4)
-        ttk.Label(advanced,text='La resolución no equivale a precisión del sensor.\nCUDA por mosaicos limita VRAM sin aumentar el voxel.',wraplength=390).pack(anchor='w',pady=8)
-        self.rgb_guidance=tk.BooleanVar(value=False)
-        self.neural_alignment=tk.BooleanVar(value=False)
-        self.neural_denoising=tk.BooleanVar(value=False)
-        ttk.Checkbutton(advanced,text='Limpieza guiada por RGB (modifica solo reconstrucción)',variable=self.rgb_guidance).pack(anchor='w')
-        ttk.Checkbutton(advanced,text='IA LoFTR para alineación (pesos locales)',variable=self.neural_alignment).pack(anchor='w')
-
+            self.params[key]=variable;ttk.Entry(advanced,textvariable=variable,width=1).pack(fill='x')
+        self.device=tk.StringVar(value='CUDA')
+        label(advanced,'RTX: alineación ICP, localización, fusión TSDF y extracción de malla. La lectura y preparación de imágenes usan CPU.')
+        self.rgb_guidance=tk.BooleanVar(value=False);self.neural_alignment=tk.BooleanVar(value=False);self.neural_denoising=tk.BooleanVar(value=False)
+        ttk.Checkbutton(advanced,text='Limpieza guiada por RGB',variable=self.rgb_guidance).pack(anchor='w',pady=4)
+        ttk.Checkbutton(advanced,text='Alineación neuronal LoFTR',variable=self.neural_alignment).pack(anchor='w',pady=4)
+        label(advanced,'Modelo de limpieza para RTX + IA')
         from model_registry import models,default
-
-        self.model_paths=models(); selected=default()
-
+        self.model_paths=models();selected=default()
         if selected not in self.model_paths:self.model_paths.append(selected)
-
         self.model_choice=tk.StringVar(value=selected.stem)
-
-        self.model_combo=ttk.Combobox(advanced,textvariable=self.model_choice,values=[p.stem for p in self.model_paths],state='readonly')
-
-        self.model_combo.pack(fill='x')
-
-        ttk.Button(advanced,text='Añadir modelo compatible (.pt + .json)',command=self.add_model).pack(fill='x')
-
-        ttk.Button(advanced,text='Establecer modelo predeterminado',command=self.default_model).pack(fill='x')
-
-        self.reconstruction_mode=tk.StringVar(value='RTX sola')
-
-        ttk.Combobox(left,textvariable=self.reconstruction_mode,values=['RTX sola','RTX + IA','Comparar ambas'],state='readonly').pack(fill='x')
-
-        self.result_choice=tk.StringVar()
-
-        self.result_combo=ttk.Combobox(left,textvariable=self.result_choice,state='readonly')
-
-        self.result_combo.pack(fill='x'); self.result_combo.bind('<<ComboboxSelected>>',self.select_result)
+        self.model_combo=ttk.Combobox(advanced,textvariable=self.model_choice,values=[p.stem for p in self.model_paths],state='readonly',width=1)
+        self.model_combo.pack(fill='x',pady=4)
+        ttk.Button(advanced,text='Añadir modelo (.pt + .json)',command=self.add_model).pack(fill='x',pady=4)
+        ttk.Button(advanced,text='Establecer predeterminado',command=self.default_model).pack(fill='x',pady=4)
+        label(capture,'TrueDepth + RGB · objetos generales')
+        self.video=tk.Label(capture,text='Vista ligera del iPhone',bg='#080e19',fg='white',height=10);self.video.pack(fill='x')
+        self.phone_message=tk.StringVar(value='Sin estado recibido del iPhone.')
+        item=ttk.Label(capture,textvariable=self.phone_message,wraplength=300);item.pack(fill='x',pady=8);wrap_labels.append(item)
+        right=ttk.Frame(body);right.grid(row=0,column=1,sticky='nsew')
+        label(right,'Visor estable · arrastrar para girar · rueda para zoom')
+        ttk.Button(right,text='Restablecer vista',command=lambda:self.viewer.reset()).pack(anchor='e',pady=4)
+        self.viewer=StableViewer(right);self.viewer.pack(fill='both',expand=True)
+        self.progress=ttk.Progressbar(self.root,maximum=100);self.progress.pack(fill='x',padx=10,pady=(6,0))
+        status_label=ttk.Label(self.root,textvariable=self.status,wraplength=900,padding=10);status_label.pack(fill='x')
+        self._layout_width=None
+        def responsive(event):
+            if event.widget is not self.root:return
+            width=event.width
+            if width==self._layout_width:return
+            self._layout_width=width
+            columns=5 if width>=1050 else 3
+            for index in range(5):actions.columnconfigure(index,weight=1 if index<columns else 0)
+            for index,button in enumerate(buttons):button.grid(row=index//columns,column=index%columns,sticky='ew',padx=2,pady=2)
+            if width<900:
+                body.columnconfigure(0,weight=1);body.columnconfigure(1,weight=1)
+                controls.grid_configure(padx=(0,6));controls.configure(width=280)
+            else:
+                body.columnconfigure(0,weight=0);body.columnconfigure(1,weight=1)
+                controls.configure(width=350)
+            status_label.configure(wraplength=max(300,width-30))
+            self.root.after_idle(lambda:[item.configure(wraplength=max(150,item.winfo_width()-8)) for item in wrap_labels])
+        self.root.bind('<Configure>',responsive,add='+')
+        self.root.update_idletasks()
+        responsive(type('Layout',(),{'widget':self.root,'width':self.root.winfo_width()})())
         self.apply_preset()
-        ttk.Button(left,text='Exportar STL (mm)',command=lambda:self.export('stl')).pack(fill='x')
-        ttk.Button(left,text='Exportar PLY color (mm)',command=lambda:self.export('ply')).pack(fill='x',pady=3)
-        right=ttk.Frame(body,padding=10); body.add(right,weight=3)
-        ttk.Label(right,text='Visor fijo · arrastrar: giro manual · rueda: zoom').pack()
-        ttk.Button(right,text='Restablecer vista',command=lambda:self.viewer.reset()).pack(anchor='e')
-        self.viewer=StableViewer(right); self.viewer.pack(fill='both',expand=True)
-        self.progress=ttk.Progressbar(self.root,maximum=100); self.progress.pack(fill='x',padx=10)
-        ttk.Label(self.root,textvariable=self.status,wraplength=1300,padding=10).pack(fill='x')
 
     def apply_preset(self):
         preset=PRESETS[self.preset_name.get()]
         for key,var in self.params.items(): var.set(getattr(preset,key))
-        self.device.set(preset.device)
+        self.device.set("CUDA")
         self.rgb_guidance.set(preset.rgb_guidance)
         self.neural_alignment.set(preset.neural_alignment)
         self.neural_denoising.set(preset.neural_denoising)
@@ -614,7 +640,7 @@ class OfflineStudio:
     def toggle_phone(self):
         if self.busy:
             self.status.set('Cancela o finaliza la reconstrucción antes de iniciar otra captura.'); return
-        self.phone_request('toggle')
+        self.phone_request('start')
 
     def preview_worker(self):
         last_status=0.
@@ -626,7 +652,7 @@ class OfflineStudio:
                 try:
                     with urllib.request.urlopen(f'http://{ip}:8080/status',timeout=1) as response:
                         status=json.loads(response.read(65536))
-                    self.post('phone_status',(bool(status.get('isScanning')),bool(status.get('busy'))))
+                    self.post('phone_status',status)
                 except Exception: pass
             try:
                 with urllib.request.urlopen(f'http://{ip}:8080/frame.jpg',timeout=1) as response:
@@ -645,7 +671,12 @@ class OfflineStudio:
                 photo=ImageTk.PhotoImage(value); self.video.configure(image=photo,text='',height=0); self.video.image=photo
             elif kind=='paired': self.ip.set(value)
             elif kind=='phone_status':
-                self.phone_active,self.phone_busy=value
+                self.phone_active,self.phone_busy=bool(value.get('isScanning')),bool(value.get('busy'))
+                self.phone_message.set(f"{value.get('frames',0)} frames · {value.get('status','')}")
+                failure=value.get('captureError','')
+                if failure:self.status.set('iPhone: '+failure)
+                self.capture_button.configure(state='disabled' if self.phone_active or self.phone_busy or self.busy else 'normal')
+                self.stop_button.configure(state='normal' if self.phone_active and not self.phone_busy else 'disabled')
                 if self.phone_active and self.busy:
                     self.cancel.set()
                     self.status.set('Captura iniciada en el iPhone: cancelando reconstrucción para priorizar la captura.')

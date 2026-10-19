@@ -32,7 +32,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Bichito3D-Unificado
-          path: Windows/dist/Bichito3D-Unificado-v3.1.exe
+          path: Windows/dist/Bichito3D-Unificado-v3.2.exe
           compression-level: 0
   build-ipa:
     runs-on: macos-14
@@ -67,7 +67,7 @@ jobs:
           swiftc TrueDepth3DScanner/CaptureRecorder.swift TrueDepth3DScanner/LosslessFrameCodec.swift Tests/main.swift -import-objc-header TrueDepth3DScanner/Scanner-Bridging-Header.h -I "$(brew --prefix zstd)/include" -L "$(brew --prefix zstd)/lib" -lzstd -o build/compression-test
           build/compression-test build/compression-fixture
           python3 -c "from pathlib import Path; import zlib, hashlib; p=Path('build/compression-fixture'); raw=(p/'compressor.b3draw').read_bytes(); encoded=(p/'compressor.b3dz').read_bytes(); assert zlib.decompress(encoded,-15)==raw; assert hashlib.sha256(encoded).hexdigest()==(p/'compressor.b3dz.sha256').read_text(); print('Swift/Python compression OK')"
-          PYTHONPATH=Windows build/codec-env/bin/python -c "from pathlib import Path; from chunk_protocol import decode_lossless_packet; p=Path('build/compression-fixture'); a=decode_lossless_packet((p/'frame0.b3dc').read_bytes()); b=decode_lossless_packet((p/'frame1.b3dc').read_bytes(),a); assert a==(p/'frame0.raw').read_bytes(); assert b==(p/'frame1.raw').read_bytes(); print('PNG/Zstd/repeat bit-exact round trip OK')"
+          PYTHONPATH=Windows build/codec-env/bin/python -c "from pathlib import Path; from chunk_protocol import decode_lossless_packet; p=Path('build/compression-fixture'); a=decode_lossless_packet((p/'frame0.b3dc').read_bytes()); b=decode_lossless_packet((p/'frame1.b3dc').read_bytes(),a); assert a==(p/'frame0.raw').read_bytes(); assert b==(p/'frame1.raw').read_bytes(); c=decode_lossless_packet((p/'frame2.b3dc').read_bytes()); assert c==(p/'frame2.raw').read_bytes(); print('PNG/Zstd/repeat bit-exact round trip OK')"
 
       - name: Empaquetar en archivo .ipa
         run: |
