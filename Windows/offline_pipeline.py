@@ -43,6 +43,7 @@ class Settings:
     device: str = 'Auto'
     rgb_guidance: bool = False
     neural_alignment: bool = False
+    neural_denoising: bool = False
     tile_cells: int = 64
 
     def validate(self):
@@ -57,7 +58,7 @@ class Settings:
         if not 128 <= self.memory_mb <= 16384 or not 1 <= self.stride <= 30: raise ValueError('Memoria: 128–16384 MB; paso: 1–30')
         if not 0 <= self.min_observations <= 20 or self.device not in ('Auto','CPU','CUDA'): raise ValueError('Configuración de fusión inválida')
         if self.tile_cells not in (16,32,64,96,128): raise ValueError('Mosaico inválido')
-        if not isinstance(self.rgb_guidance,bool) or not isinstance(self.neural_alignment,bool): raise ValueError('Opciones RGB/IA inválidas')
+        if any(not isinstance(value,bool) for value in (self.rgb_guidance,self.neural_alignment,self.neural_denoising)): raise ValueError('Opciones RGB/IA inválidas')
         return self
 
 
@@ -228,6 +229,10 @@ def prepare_frame(frame,settings):
         rgb=cv2.remap(rgb,mx,my,cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT)
     valid=np.isfinite(depth)&(depth>=settings.min_depth_m)&(depth<=settings.max_depth_m)
     safe=np.where(valid,depth,0).astype(np.float32)
+    if settings.neural_denoising:
+        from neural_depth import denoise_depth
+        safe=denoise_depth(safe,rgb)
+        safe=np.where(valid,np.clip(safe,settings.min_depth_m,settings.max_depth_m),0).astype(np.float32)
     if settings.rgb_guidance:
         total=safe.copy(); weight=(safe>0).astype(np.float32)
         color=rgb.astype(np.float32)
@@ -479,8 +484,10 @@ class OfflineStudio:
         ttk.Label(advanced,text='La resolución no equivale a precisión del sensor.\nCUDA por mosaicos limita VRAM sin aumentar el voxel.',wraplength=390).pack(anchor='w',pady=8)
         self.rgb_guidance=tk.BooleanVar(value=False)
         self.neural_alignment=tk.BooleanVar(value=False)
+        self.neural_denoising=tk.BooleanVar(value=False)
         ttk.Checkbutton(advanced,text='Limpieza guiada por RGB (modifica solo reconstrucción)',variable=self.rgb_guidance).pack(anchor='w')
         ttk.Checkbutton(advanced,text='IA LoFTR para alineación (pesos locales)',variable=self.neural_alignment).pack(anchor='w')
+        ttk.Checkbutton(advanced,text='IA profundidad experimental (NYU; requiere modo RTX / IA)',variable=self.neural_denoising).pack(anchor='w')
         self.apply_preset()
         ttk.Button(left,text='Exportar STL (mm)',command=lambda:self.export('stl')).pack(fill='x')
         ttk.Button(left,text='Exportar PLY color (mm)',command=lambda:self.export('ply')).pack(fill='x',pady=3)
@@ -498,13 +505,17 @@ class OfflineStudio:
         self.device.set(preset.device)
         self.rgb_guidance.set(preset.rgb_guidance)
         self.neural_alignment.set(preset.neural_alignment)
+        self.neural_denoising.set(preset.neural_denoising)
         self.res_label.config(text=f'{preset.resolution_mm:.3f} mm')
 
     def launch_gpu(self):
         if self.busy or self.phone_active:
             self.status.set('Finaliza la captura o reconstrucción antes de cambiar al modo RTX.'); return
         import sys,subprocess
-        base=Path(sys.executable).parent.parent if getattr(sys,'frozen',False) else Path(__file__).parent
+        base=Path(__file__).parent
+        if getattr(sys,'frozen',False):
+            local=Path(sys.executable).parent
+            base=local.parent if (local.parent/'.gpu-runtime'/'Scripts'/'python.exe').exists() else local
         python=base/'.gpu-runtime'/'Scripts'/'python.exe'
         entry=base/'Bichito3D_ReconstructionEngine.py'
         if not python.exists() or not entry.exists():
@@ -519,7 +530,7 @@ class OfflineStudio:
         for name in ('memory_mb','stride'):
             if data[name]!=int(data[name]): raise ValueError(f'{name} debe ser entero')
             data[name]=int(data[name])
-        data['device']=self.device.get(); data['rgb_guidance']=self.rgb_guidance.get(); data['neural_alignment']=self.neural_alignment.get(); return Settings(**data).validate()
+        data['device']=self.device.get(); data['rgb_guidance']=self.rgb_guidance.get(); data['neural_alignment']=self.neural_alignment.get(); data['neural_denoising']=self.neural_denoising.get(); return Settings(**data).validate()
 
     def phone_request(self,path):
         ip=self.ip.get().strip()
@@ -604,6 +615,10 @@ class OfflineStudio:
         if self.session is None: self.status.set('Primero finaliza y transfiere una captura, o abre una sesión.'); return
         try: settings=self.read_settings()
         except (ValueError,tk.TclError) as error: self.status.set(str(error)); return
+        if settings.neural_denoising or settings.neural_alignment:
+            import importlib.util
+            if importlib.util.find_spec('torch') is None:
+                self.status.set('La IA necesita el runtime local. Pulsa Abrir modo RTX / IA y activa allí la opción.'); return
         self.busy=True; self.cancel.clear(); path=self.session; self.status.set('Preparando reconstrucción diferida…')
         def worker():
             try:

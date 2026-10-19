@@ -22,12 +22,15 @@ La RTX 5060 ejecutó una reconstrucción sintética de 3 frames a 0.05 mm: 1.521
 
 Limpieza conjunta guiada por textura/bordes RGB, opcional y aplicada solo al reconstruir. No se modifica el archivo de mediciones. No se denomina photometric stereo: no hay un sistema de iluminación controlada que justifique ese modelo físico.
 
-LoFTR preentrenado outdoor de Kornia: alineación de características opcional, inferencia local con PyTorch 2.8 CUDA 12.8, semillas de pose rígida robusta y validación final ICP. Los pesos públicos se descargaron por HTTPS, se fijó SHA-256 y se comprobó inferencia en la RTX. Las imágenes no se envían a servicios externos. Pesos de UNet/MobileStereoNet entrenados para el ruido específico de TrueDepth no fueron proporcionados: no se ha inventado ni activado un modelo de limpieza que afirme precisión profesional sin validación.
+LoFTR preentrenado outdoor de Kornia: alineación de características opcional, inferencia local con PyTorch 2.8 CUDA 12.8, semillas de pose rígida robusta y validación final ICP. Los pesos públicos se descargaron por HTTPS, se fijó SHA-256 y se comprobó inferencia en la RTX. Las imágenes no se envían a servicios externos.
+
+Limpieza neuronal: U-Net residual propia entrenada desde cero en esta RTX con NYU Depth V2 descargado de su fuente original. Se entrega código, pesos verificados, particiones por escena e informe. En parches del conjunto de prueba reservado con ruido sintético: RMSE 2.4878 → 1.3927 mm (44.0 % menos). Activar Avanzado → IA profundidad experimental desde el modo RTX / IA. Solo modifica copias para reconstrucción, no rellena huecos y limita las correcciones a 10 mm. No se encontraron pesos públicos verificables apropiados para TrueDepth; el estudio específico de iPhone X localizado no publica pesos. Esta evaluación sobre Kinect reescalado y ruido sintético **no valida exactitud en TrueDepth**. Ver `DEPTH_MODEL_RESEARCH.md` y `models/depth_denoiser_v1.json`.
 
 ## Validación
 
-26 pruebas locales aprobadas, incluidas CUDA real, inicialización idempotente del runtime, protocolo, datos Float32/PNG bit a bit, reintentos, persistencia, presets y geometría. Pruebas adicionales: WebSocket con desconexión y reconexión real, reconstrucción fina en la RTX, carga e inferencia LoFTR. CI compila iOS/Windows y prueba el codec Swift contra Python; sus runners sin GPU omiten las pruebas CUDA, que se ejecutaron localmente.
+31 pruebas locales, incluidas CUDA real, inicialización idempotente del runtime, protocolo, datos Float32/PNG bit a bit, reintentos, persistencia, presets, geometría, inferencia neuronal y separación de escenas. Pruebas adicionales: WebSocket con desconexión y reconexión real, reconstrucción fina en la RTX, carga e inferencia LoFTR. CI compila iOS/Windows y prueba el codec Swift contra Python; sus runners sin GPU omiten las pruebas CUDA y PyTorch opcionales, que se ejecutan localmente.
 
 Pendiente: medir calidad, tasa de compresión, temperatura, pérdidas y recuperación con el iPhone real y capturas representativas. Sin esa evidencia no se garantiza que se hayan eliminado todos los cierres ni un acabado profesional.
 
 Referencias: [Zstandard oficial](https://github.com/facebook/zstd), [OpenEXR Float/Half](https://openexr.com/en/latest/TechnicalIntroduction.html), [LoFTR de Kornia](https://kornia.readthedocs.io/en/latest/models/loftr.html), [instalación CuPy](https://docs.cupy.dev/en/stable/install.html).
+
