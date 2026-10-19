@@ -1,4 +1,8 @@
-# Bichito 3D 3.0 — entrega y límites
+# Bichito 3D 3.1 — ejecutable unificado
+
+La versión actual incluye RTX e IA en un único EXE, comparación de reconstrucciones y gestor de modelos persistente. Ver [cambios e instrucciones 3.1](UNIFICADO_3_1.md). La documentación histórica 3.0 a continuación describe el protocolo y los límites, pero el lanzador RTX separado queda sustituido por el EXE unificado.
+
+# Documentación del protocolo 3.0
 
 Modo Simple predeterminado: Estándar (0.5 mm), Sketch (2 mm), Alta (0.2 mm), Máxima (0.05 mm). El panel Avanzado conserva resolución exacta, ICP, color, muestreo, memoria y backend. 1:1 no significa precisión física de 0.05 mm. El visor no usa movimiento automático ni orientación IMU para girar.
 

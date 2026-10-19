@@ -3,3 +3,4 @@ __pycache__/
 Windows/build/
 Windows/dist/
 Windows/*.spec
+!Windows/unified.spec
