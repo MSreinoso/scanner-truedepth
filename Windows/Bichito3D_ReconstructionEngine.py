@@ -1311,5 +1311,8 @@ if __name__ == "__main__":
     if len(sys.argv)==3 and sys.argv[1]=='--diagnostic':
         from bundle_checks import run
         raise SystemExit(run(sys.argv[2]))
+    if len(sys.argv)>=3 and sys.argv[1]=='--validate':
+        from validation_v33 import run as validate
+        raise SystemExit(validate(sys.argv[2],float(sys.argv[3]) if len(sys.argv)>3 else .2))
     from offline_pipeline import main
     main()

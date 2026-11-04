@@ -74,6 +74,7 @@ final class FrameSerializer {
         // ──────────────────────────────────────────────
         // 1. Depth buffer — ensure Float32 pixel format
         // ──────────────────────────────────────────────
+        let originalDepthType = depthData.depthDataType
         let convertedDepth: AVDepthData
         if depthData.depthDataType != kCVPixelFormatType_DepthFloat32 {
             convertedDepth = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
@@ -275,6 +276,12 @@ final class FrameSerializer {
         if rawCapture {
             var calibrationInfo: [String: Any] = ["rgbAlignment": "AVFoundation synchronized depth/video, native orientation"]
             calibrationInfo["motionTimestamp"] = deviceMotion?.timestamp
+            // Provenance: whether the stored Float32 bits are the sensor's own or a conversion.
+            let code = originalDepthType
+            calibrationInfo["depthOriginalFormat"] = String(bytes: [UInt8((code >> 24) & 0xff), UInt8((code >> 16) & 0xff), UInt8((code >> 8) & 0xff), UInt8(code & 0xff)], encoding: .ascii) ?? "\(code)"
+            calibrationInfo["depthConverted"] = originalDepthType != kCVPixelFormatType_DepthFloat32
+            calibrationInfo["depthAccuracy"] = depthData.depthDataAccuracy == .absolute ? "absolute" : "relative"
+            calibrationInfo["depthFiltered"] = depthData.isDepthDataFiltered
             if let cal = convertedDepth.cameraCalibrationData {
                 calibrationInfo["referenceSize"] = [cal.intrinsicMatrixReferenceDimensions.width, cal.intrinsicMatrixReferenceDimensions.height]
                 calibrationInfo["distortionCenter"] = [cal.lensDistortionCenter.x, cal.lensDistortionCenter.y]

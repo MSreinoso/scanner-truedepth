@@ -56,7 +56,7 @@ def decode_lossless_packet(packet, previous=None):
 
 
 def stream_records(path):
-    from offline_pipeline import decode_frame
+    from capture_format import decode_frame
     path=Path(path); meta=json.loads(path.read_text(encoding='utf-8'))
     session=str(uuid.UUID(meta['session']))
     folder=path.parent/'Chunks'/session
@@ -91,7 +91,7 @@ class BlockStore:
         raise ValueError('Falta keyframe de referencia')
 
     def accept(self,session,message):
-        from offline_pipeline import decode_frame
+        from capture_format import decode_frame
         if not 136<=len(message)<=MAX_BLOCK+36: raise ValueError('Mensaje fuera de límites')
         seq=struct.unpack_from('<I',message)[0]
         if seq>=1_000_000: raise ValueError('Secuencia fuera de límites')
@@ -115,7 +115,7 @@ class BlockStore:
         return {'op':'ack','session':str(uuid.UUID(session)),'seq':seq,'sha256':digest}
 
     def finish(self,session,frames,dropped,interrupted=False):
-        from offline_pipeline import validate_session
+        from capture_format import validate_session
         session=str(uuid.UUID(session))
         if not isinstance(frames,int) or not 0<frames<=1_000_000 or not isinstance(dropped,int) or dropped<0: raise ValueError('Manifiesto incorrecto')
         target=self.directory/(session+'.b3dstream')
@@ -134,26 +134,41 @@ class BlockStore:
         return target,{'op':'committed',**value}
 
 
+def open_reply(hello):
+    """Validate the opening message. The reply echoes the session string exactly
+    as the phone sent it: iOS used upper-case UUID folders before 3.3 and
+    compared the echo literally, which rejected every reply and never freed
+    the phone cache."""
+    if not isinstance(hello,dict) or hello.get('op')!='open' or hello.get('version')!=3: raise ValueError('Protocolo incompatible')
+    original=str(hello.get('session',''))
+    canonical=str(uuid.UUID(original))
+    return original,canonical,{'op':'opened','session':original}
+
+
 class BlockServer:
-    def __init__(self,directory,callback,host='0.0.0.0',port=50508):
+    def __init__(self,directory,callback,host='0.0.0.0',port=50508,on_block=None,on_error=None):
         from websockets.sync.server import serve
         self.store=BlockStore(directory); self.callback=callback
+        self.on_block=on_block or (lambda session,seq:None); self.on_error=on_error or (lambda session,error:None)
         self.server=serve(self.handle,host,port,max_size=MAX_BLOCK+36,compression=None,open_timeout=10,close_timeout=5)
 
     def handle(self,socket):
+        session=None
         try:
-            hello=json.loads(socket.recv(timeout=15))
-            if hello.get('op')!='open' or hello.get('version')!=3: raise ValueError('Protocolo incompatible')
-            session=str(uuid.UUID(hello['session']))
-            socket.send(json.dumps({'op':'opened','session':session}))
+            original,session,reply=open_reply(json.loads(socket.recv(timeout=15)))
+            socket.send(json.dumps(reply))
             for message in socket:
-                if isinstance(message,bytes): socket.send(json.dumps(self.store.accept(session,message)))
+                if isinstance(message,bytes):
+                    ack=self.store.accept(session,message); ack['session']=original
+                    socket.send(json.dumps(ack)); self.on_block(session,ack['seq'])
                 else:
                     value=json.loads(message)
-                    if value.get('op')!='finish' or value.get('session')!=session: raise ValueError('Comando inválido')
+                    if value.get('op')!='finish' or str(value.get('session','')).lower()!=session: raise ValueError('Comando inválido')
                     path,receipt=self.store.finish(session,value['frames'],value['dropped'],value.get('interrupted',False))
-                    socket.send(json.dumps(receipt)); self.callback(path,receipt); return
+                    socket.send(json.dumps({**receipt,'session':original})); self.callback(path,receipt); return
         except Exception as error:
+            # Explicit error: the phone keeps the block and reports this text.
+            self.on_error(session,str(error))
             try: socket.send(json.dumps({'error':str(error)}))
             except Exception: pass
 

@@ -49,3 +49,39 @@ try recorder.append(nonOpaque)
 precondition(recorder.count == 1)
 let recorded = try recorder.finish(dropped: 0)
 try FileManager.default.removeItem(at: recorded)
+
+// Optional end-to-end run against the Windows block server:
+//   compression-test <fixture> <port> <scans-dir> <raw-dir>
+if CommandLine.arguments.count > 4, let port = Int(CommandLine.arguments[2]) {
+    let scans = URL(fileURLWithPath: CommandLine.arguments[3], isDirectory: true)
+    let rawFolder = URL(fileURLWithPath: CommandLine.arguments[4], isDirectory: true)
+    try FileManager.default.createDirectory(at: rawFolder, withIntermediateDirectories: true)
+    CaptureRecorder.overrideDirectory = scans
+    let session = CaptureRecorder()
+    try session.start()
+    for id in 0..<12 {
+        let raw = frame(UInt32(id)) // identical pixels after frame 0 exercise exact-repeat blocks
+        try session.append(raw)
+        try raw.write(to: rawFolder.appendingPathComponent(String(format: "ws%03d.raw", id)))
+    }
+    let finished = try session.finish(dropped: 0)
+    // Pre-3.3 phones created upper-case session folders; keep that case covered.
+    let legacy = finished.deletingLastPathComponent().appendingPathComponent(finished.lastPathComponent.uppercased())
+    try FileManager.default.moveItem(at: finished, to: legacy)
+    let manifestURL = legacy.appendingPathComponent("session.json")
+    var manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as! [String: Any]
+    manifest["session"] = legacy.lastPathComponent
+    try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+    let streamer = ChunkStreamer(address: { "127.0.0.1" })
+    streamer.port = port
+    streamer.replyTimeout = 5
+    streamer.window = 3
+    streamer.onStatus = { kind, text in print("[stream] \(kind.rawValue): \(text)") }
+    streamer.start()
+    let deadline = Date().addingTimeInterval(100)
+    while FileManager.default.fileExists(atPath: legacy.path) && Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+    }
+    precondition(!FileManager.default.fileExists(atPath: legacy.path), "Session was not committed and released")
+    print("IOS_UPLOAD_OK \(legacy.lastPathComponent)")
+}

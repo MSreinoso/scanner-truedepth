@@ -108,21 +108,29 @@ class CudaTile:
           (self.field,self.weights,self.colors,cp.asarray(depth,dtype=cp.float32),cp.asarray(rgb,dtype=cp.uint8),E,K,
            np.int32(w),np.int32(h),np.int32(self.side),*[np.float32(v) for v in self.origin],np.float32(self.voxel),np.float32(max(self.voxel*8,.002))))
 
-    def mesh(self,min_weight=1.):
+    def mesh(self,min_weight=1.,stride=1):
+        """Marching Cubes in CUDA. stride>1 samples the same TSDF every `stride`
+        voxels: a coarser but coherent surface used only for the viewer."""
         cp=self.cp
         from skimage.measure import _marching_cubes_lewiner_luts as lut
         table=cp.asarray(np.frombuffer(base64.decodebytes(lut.CASESCLASSIC[1].encode()),np.int8))
-        n=self.cells**3; counts=cp.empty(n,dtype=cp.int32); cases=cp.empty(n,dtype=cp.int32)
+        field,weights,colors,cells=self.field,self.weights,self.colors,self.cells
+        if stride>1:
+            if cells%stride: raise ValueError('Paso de LOD incompatible con el mosaico')
+            side=self.side
+            pick=lambda a,c=1: cp.ascontiguousarray(a.reshape((side,side,side)+((c,) if c>1 else ()))[::stride,::stride,::stride]).reshape((-1,c) if c>1 else (-1,))
+            field,weights,colors=pick(field),pick(weights),pick(colors,3); cells//=stride
+        n=cells**3; counts=cp.empty(n,dtype=cp.int32); cases=cp.empty(n,dtype=cp.int32)
         cp.RawKernel(MARCH,'count_triangles')(((n+255)//256,),(256,),
-          (self.field,self.weights,table,counts,cases,np.int32(self.cells),np.float32(min_weight)))
+          (field,weights,table,counts,cases,np.int32(cells),np.float32(min_weight)))
         offsets=cp.cumsum(counts,dtype=cp.int64)-counts
         total=int(cp.sum(counts).get())
         if not total: return np.empty((0,3,3),np.float32),np.empty((0,3,3),np.float32)
-        vertices=cp.empty((total,3,3),cp.float32); colors=cp.empty_like(vertices)
+        vertices=cp.empty((total,3,3),cp.float32); out_colors=cp.empty_like(vertices)
         cp.RawKernel(MARCH,'emit_triangles')(((n+255)//256,),(256,),
-          (self.field,self.colors,table,counts,cases,offsets,vertices,colors,np.int32(self.cells),
-           *[np.float32(v) for v in self.origin],np.float32(self.voxel)))
-        return vertices.get(),colors.get()
+          (field,colors,table,counts,cases,offsets,vertices,out_colors,np.int32(cells),
+           *[np.float32(v) for v in self.origin],np.float32(self.voxel*stride)))
+        return vertices.get(),out_colors.get()
 
 
 class TriangleCount:
@@ -131,11 +139,31 @@ class TriangleCount:
 
 
 class TiledModel:
+    """Full-resolution triangles live in tile-*.npz (exported unchanged).
+    view-*.npz hold welded display LODs derived from the same TSDF."""
     def __init__(self,folder):
-        self.folder=Path(folder); meta=json.loads((self.folder/'model.json').read_text())
+        self.folder=Path(folder); self.meta=meta=json.loads((self.folder/'model.json').read_text())
         self.triangles=TriangleCount(meta['triangles']); self.total_vertices=meta['triangles']*3
-        with np.load(self.folder/'preview.npz') as preview:
-            self.vertices=preview['vertices']; self.vertex_colors=preview['colors']
+
+    def view_levels(self):
+        levels=[]
+        for path in self.folder.glob('view-*.npz'):
+            with np.load(path) as data: levels.append((int(data['stride']),int(len(data['faces'])),path))
+        return sorted(levels)
+
+    def view_mesh(self,budget=None):
+        from mesh_view import ViewMesh,VIEW_BUDGET
+        budget=budget or VIEW_BUDGET
+        levels=self.view_levels()
+        if not levels: raise ValueError('Este resultado no tiene malla de visualización; reconstruye con la versión 3.3.')
+        fitting=[level for level in levels if level[1]<=budget]
+        stride,count,path=fitting[0] if fitting else levels[-1]
+        with np.load(path) as data:
+            colors=data['colors'] if data['colors'].size else None
+            mesh=ViewMesh(data['vertices'],data['faces'],data['normals'].astype(np.float32),colors,
+                'malla completa' if stride==1 else f'LOD 1/{stride} del mismo TSDF (vóxel {self.meta["settings"]["resolution_mm"]*stride:.3g} mm)',
+                len(self.triangles))
+        return mesh
 
     def export_mm(self,path):
         path=Path(path); parts=sorted(self.folder.glob('tile-*.npz'))
@@ -169,47 +197,80 @@ class TiledModel:
         return True
 
 
+LOD_STRIDES=(1,2,4,8,16)
+
+
+def rotation_angle(transform):
+    return math.degrees(math.acos(float(np.clip((np.trace(transform[:3,:3])-1)/2,-1,1))))
+
+
 def reconstruct_tiled(path,settings,progress,cancel):
-    from offline_pipeline import validate_session,records,prepare_frame,relative_rotation
+    """All dense 3D stages on the RTX. CPU: decoding, rectification, file I/O
+    and per-tile frustum culling of a handful of scalars."""
+    from capture_format import validate_session,records
+    from offline_pipeline import prepare_frame,relative_rotation
     from cuda_registration import register,surface_tile_keys,unique_tiles
+    from mesh_view import weld,VIEW_BUDGET
     metadata=validate_session(path)
+    clock=__import__('time').perf_counter; t0=clock(); timings={}
     folder=Path(path).parent/(Path(path).stem+'-cuda-'+__import__('uuid').uuid4().hex[:8])
     folder.mkdir(); inputs=folder/'inputs'; inputs.mkdir()
     cp=cuda_module()
+    stages=[]
     cells=settings.tile_cells; voxel=settings.resolution_mm/1000; width=cells*voxel
     keys=cp.empty((0,3),dtype=cp.int64)
-    previous,previous_imu,pose=None,None,np.eye(4)
-    previous_images,previous_intrinsics=None,None
-    accepted=[]; rejected=0
+    # Keyframe registration: each frame aligns to the current keyframe (not to
+    # the previous frame), so small per-frame errors do not add up. A new
+    # keyframe is taken when overlap drops or the motion grows.
+    key=None; last=None
+    accepted=[]; rejected=0; keyframes=0; fallback=0
     for index,frame in enumerate(records(path)):
         if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; sesión original conservada')
         if index%settings.stride: continue
-        depth,rgb=prepare_frame(frame,settings); h,w=depth.shape; fx,fy,cx,cy=frame.intrinsics
+        depth,rgb=prepare_frame(frame,settings); fx,fy,cx,cy=frame.intrinsics
         cloud=cp.asarray(depth)
         valid,delta,fitness,rmse=int(cp.count_nonzero(cloud))>=100,np.eye(4),1.,0.
-        if valid and previous is not None:
-            initial=np.eye(4); initial[:3,:3]=relative_rotation(previous_imu,frame.rotation)
+        candidate=np.eye(4); promote=key is None
+        if valid and key is not None:
+            imu=np.eye(4); imu[:3,:3]=relative_rotation(last['imu'],frame.rotation)
+            guess=np.linalg.inv(key['pose'])@last['pose']@imu
             if settings.neural_alignment:
                 from ai_alignment import neural_seed
-                initial=neural_seed((depth,rgb),previous_images,frame.intrinsics,previous_intrinsics)
-            try: valid,delta,fitness,rmse=register(cloud,previous,frame.intrinsics,previous_intrinsics,initial,settings)
+                seed=neural_seed((depth,rgb),key['images'],frame.intrinsics,key['intrinsics'],require_cuda=True)
+                if seed is not None: guess=seed
+            try: valid,delta,fitness,rmse=register(cloud,key['depth'],frame.intrinsics,key['intrinsics'],guess,settings)
             except ValueError: valid=False
+            candidate=key['pose']@delta
+            if valid:
+                promote=(fitness<min(.95,settings.min_fitness+.2) or np.linalg.norm(delta[:3,3])>.02 or rotation_angle(delta)>10)
+            elif last is not key:
+                # Keyframe out of reach: try the immediately previous frame, then promote.
+                try: valid,delta,fitness,rmse=register(cloud,last['depth'],frame.intrinsics,last['intrinsics'],imu,settings)
+                except ValueError: valid=False
+                candidate=last['pose']@delta; promote=valid; fallback+=valid
         if valid:
-            candidate=pose@delta
             frame_keys=surface_tile_keys(cloud,frame.intrinsics,candidate,width)
             keys=unique_tiles(cp.concatenate((keys,frame_keys)))
-            pose,previous,previous_imu=candidate,cloud,frame.rotation
-            previous_images,previous_intrinsics=(depth,rgb),frame.intrinsics
+            current={'pose':candidate,'depth':cloud,'intrinsics':frame.intrinsics,'imu':frame.rotation,'images':(depth,rgb)}
+            last=current
+            if promote: key=current; keyframes+=1
             name=f'{index:09d}'
             np.save(inputs/(name+'-depth.npy'),depth);np.save(inputs/(name+'-rgb.npy'),rgb)
-            accepted.append((name,pose.copy(),frame.intrinsics.copy()))
+            accepted.append((name,candidate.copy(),frame.intrinsics.copy(),np.linalg.inv(candidate)))
         else: rejected+=1
-        progress(index+1,metadata['frames'],len(accepted),rejected,'CUDA: alineación y localización de superficie',fitness,rmse)
-    if len(accepted)<2: raise ValueError('Pocos frames alineados para reconstruir')
+        progress(index+1,metadata['frames'],len(accepted),rejected,'RTX · alineación ICP y localización de superficie (CUDA)',fitness,rmse)
+    timings['alineacion_s']=round(clock()-t0,2); t1=clock()
+    stages.append({'etapa':'Decodificación y rectificación RGB-D','dispositivo':'CPU'})
+    stages.append({'etapa':'ICP punto-plano coarse-to-fine con keyframes','dispositivo':'CUDA'})
+    stages.append({'etapa':'Localización de superficie en mosaicos','dispositivo':'CUDA'})
+    if settings.neural_denoising: stages.append({'etapa':'Limpieza neuronal de profundidad','dispositivo':'CUDA (PyTorch)'})
+    if settings.neural_alignment: stages.append({'etapa':'Semilla de alineación LoFTR','dispositivo':'CUDA (PyTorch)'})
+    if len(accepted)<2: raise ValueError(f'Pocos frames alineados para reconstruir ({len(accepted)} aceptados, {rejected} rechazados). Revisa distancia, movimiento y parámetros ICP.')
     if len(keys)==0: raise ValueError('No se obtuvo superficie global consistente')
     keys=unique_tiles(cp.concatenate([keys+cp.asarray([x,y,z]) for x in (-1,0,1) for y in (-1,0,1) for z in (-1,0,1)]))
     keys=cp.asnumpy(keys)
-    total=0; samples=[]; sample_colors=[]
+    total=0
+    lods={k:([],[],0) for k in LOD_STRIDES if cells%k==0}
     from collections import OrderedDict
     cache=OrderedDict();cache_bytes=0
     cache_limit=min(settings.memory_mb*1024**2//2,cp.cuda.runtime.memGetInfo()[0]//4)
@@ -224,12 +285,13 @@ def reconstruct_tiled(path,settings,progress,cancel):
         value=(depth,rgb,cp.asarray(depth),cp.asarray(rgb))
         cache[name]=value;cache_bytes+=size
         return value
-    for tile_index,key in enumerate(keys):
+    peak=0
+    for tile_index,tile_key in enumerate(keys):
         if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; mosaicos terminados y originales conservados')
-        origin=key.astype(np.float64)*width; center=origin+width/2; radius=math.sqrt(3)*width/2+.004
+        origin=tile_key.astype(np.float64)*width; center=origin+width/2; radius=math.sqrt(3)*width/2+.004
         tile=CudaTile(cells,voxel,origin)
-        for name,pose,intrinsics in accepted:
-            point=np.linalg.inv(pose)@np.r_[center,1.]
+        for name,pose,intrinsics,inverse in accepted:
+            point=inverse@np.r_[center,1.]
             if point[2]<=0: continue
             depth,rgb,gpu_depth,gpu_rgb=prepared(name); h,w=depth.shape; fx,fy,cx,cy=intrinsics
             u,v=fx*point[0]/point[2]+cx,fy*point[1]/point[2]+cy
@@ -239,25 +301,44 @@ def reconstruct_tiled(path,settings,progress,cancel):
             valid=crop[crop>0]
             if len(valid)==0 or valid.min()>point[2]+radius or valid.max()<point[2]-radius: continue
             tile.integrate(gpu_depth,gpu_rgb,intrinsics,pose)
-        vertices,colors=tile.mesh(max(1.,settings.min_observations))
+        minimum=max(1.,settings.min_observations)
+        vertices,colors=tile.mesh(minimum)
         if len(vertices):
             np.savez(folder/f'tile-{tile_index:08d}.npz',vertices=vertices,colors=colors)
             total+=len(vertices)
-            flat=vertices.reshape(-1,3); cflat=colors.reshape(-1,3)
-            step=max(1,len(flat)//30);samples.append(flat[::step][:30]);sample_colors.append(cflat[::step][:30])
-            # Preview alone is bounded; full triangles stay in tile files.
-            if sum(len(v) for v in samples)>12000:
-                combined=np.concatenate(samples)[::2]; cc=np.concatenate(sample_colors)[::2];samples=[combined];sample_colors=[cc]
+        for k in list(lods):
+            v,c=(vertices,colors) if k==1 else tile.mesh(minimum,k)
+            parts,cparts,count=lods[k]
+            if len(v):
+                parts.append(v); cparts.append(np.clip(c*255+.5,0,255).astype(np.uint8)); count+=len(v)
+            if count>VIEW_BUDGET: del lods[k]   # too dense for display; coarser levels remain
+            else: lods[k]=(parts,cparts,count)
+        peak=max(peak,cp.get_default_memory_pool().total_bytes())
         del tile
-        progress(tile_index+1,len(keys),len(accepted),rejected,f'CUDA mosaico {tile_index+1}/{len(keys)}',1.,0.)
+        progress(tile_index+1,len(keys),len(accepted),rejected,f'RTX · TSDF + Marching Cubes CUDA, mosaico {tile_index+1}/{len(keys)}',1.,0.)
     if total==0: raise ValueError('No se obtuvo malla fina consistente')
-    np.savez_compressed(folder/'preview.npz',vertices=np.concatenate(samples),colors=np.concatenate(sample_colors))
+    timings['tsdf_marching_cubes_s']=round(clock()-t1,2); t2=clock()
+    stages.append({'etapa':'TSDF por mosaicos','dispositivo':'CUDA'})
+    stages.append({'etapa':'Marching Cubes (malla completa y LOD de visor)','dispositivo':'CUDA'})
+    saved=[]
+    for k,(parts,cparts,count) in sorted(lods.items()):
+        if not count: continue
+        V,F,N,C=weld(np.concatenate(parts),np.concatenate(cparts),quantum=voxel*k/64,xp=cp)
+        np.savez(folder/f'view-{k:02d}.npz',stride=k,vertices=V,faces=F,normals=N.astype(np.float16),colors=C)
+        saved.append({'paso':k,'triangulos':int(len(F))})
+    timings['malla_visor_s']=round(clock()-t2,2)
+    stages.append({'etapa':'Soldadura de la malla de visualización','dispositivo':'CUDA'})
+    stages.append({'etapa':'Escritura de mosaicos y exportación','dispositivo':'CPU (E/S)'})
     report={'settings':__import__('dataclasses').asdict(settings),'captured':metadata,'accepted':len(accepted),'rejected':rejected,
+            'keyframes':keyframes,'keyframe_fallbacks':int(fallback),
             'device':'CUDA: ICP + localización + TSDF + Marching Cubes',
             'gpu_name':cp.cuda.runtime.getDeviceProperties(0)['name'].decode(),
-            'cpu_tasks':['decodificación, rectificación RGB-D y E/S'],
-            'registration':'CUDA projective point-to-plane coarse-to-fine','vertices':total*3,'triangles':total,'tiles':len(keys),'folder':str(folder)}
-    (folder/'model.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+            'stages':stages,'cpu_tasks':['decodificación y rectificación RGB-D','selección de vistas por mosaico (escalares)','E/S de disco'],
+            'vram_pool_peak_mb':round(peak/1024**2,1),'timings':timings,
+            'registration':'CUDA projective point-to-plane coarse-to-fine, alineación a keyframe',
+            'resolution_note':'resolution_mm es el tamaño de vóxel de la reconstrucción, no la precisión física del sensor TrueDepth.',
+            'vertices':total*3,'triangles':total,'tiles':len(keys),'view_levels':saved,'folder':str(folder)}
+    (folder/'model.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')
     # Prepared images are a reconstructible PC cache, never the source session.
     import shutil
     if inputs.resolve().parent!=folder.resolve() or inputs.name!='inputs': raise ValueError('Ruta de caché inválida')

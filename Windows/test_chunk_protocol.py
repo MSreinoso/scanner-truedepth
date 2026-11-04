@@ -9,7 +9,7 @@ import uuid
 import numpy as np
 from PIL import Image
 import zstandard as zstd
-from chunk_protocol import decode_lossless_packet,BlockStore
+from chunk_protocol import decode_lossless_packet,BlockStore,open_reply
 from test_offline_pipeline import raw_packet
 from offline_pipeline import validate_session,records
 from ai_alignment import robust_pose
@@ -67,6 +67,23 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(validate_session(path)['frames'],2)
         self.assertEqual(len(list(records(path))),2)
         self.assertEqual(self.store.finish(self.session,2,0)[0],path)
+
+    def test_upper_case_session_from_ios_is_echoed_and_stored_once(self):
+        # iOS 3.2 and earlier named sessions with UUID().uuidString (upper case)
+        # and compared Windows' echo literally. The echo must be identical.
+        upper=str(uuid.uuid4()).upper()
+        original,canonical,reply=open_reply({'op':'open','session':upper,'version':3})
+        self.assertEqual(reply,{'op':'opened','session':upper})
+        self.assertEqual(original,upper); self.assertEqual(canonical,upper.lower())
+        packet=encode(raw_packet(0))
+        first=self.store.accept(canonical,message(0,packet))
+        second=self.store.accept(upper.lower(),message(0,packet))
+        self.assertEqual(first,second)
+        self.assertEqual(len(list(self.store.folder(upper).glob('*.b3dc'))),1)
+
+    def test_open_rejects_other_protocols(self):
+        for hello in ({'op':'open','session':str(uuid.uuid4()),'version':2},{'op':'hello'},{'op':'open','session':'x','version':3}):
+            with self.assertRaises(ValueError): open_reply(hello)
 
     def test_robust_neural_pose_rejects_outliers(self):
         rng=np.random.default_rng(2); source=rng.normal(size=(30,3))*.02

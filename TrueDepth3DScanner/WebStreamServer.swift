@@ -16,9 +16,9 @@ class WebStreamServer: ObservableObject {
     var getLatestPLY: (() -> Data?)?
     var getLatestNewPoints: (() -> Data?)?
     var getStatusJSON: (() -> String)?
-    var onToggleScan: (() -> Void)?
-    var onStartScan: (() -> Void)?
-    var onStopScan: (() -> Void)?
+    var onToggleScan: ((CaptureSource) -> Void)?
+    var onStartScan: ((CaptureSource) -> Void)?
+    var onStopScan: ((CaptureSource) -> Void)?
     var onConnectToPC: ((String) -> Void)?
     var onClearScan: (() -> Void)?
     var onTriggerShareOnPhone: (() -> Void)?
@@ -60,7 +60,10 @@ class WebStreamServer: ObservableObject {
             
             let firstLine = request.components(separatedBy: "\r\n").first ?? ""
             let parts = firstLine.components(separatedBy: " ")
-            let path = parts.count > 1 ? parts[1] : "/"
+            let target = parts.count > 1 ? parts[1] : "/"
+            let path = String(target.split(separator: "?", maxSplits: 1).first ?? "/")
+            // Commands from the iPhone's own web panel carry src=web; Windows sends none.
+            let source: CaptureSource = target.contains("src=web") ? .web : .windows
             
             if path == "/connect" {
                 guard case let .hostPort(host, _) = connection.endpoint else {
@@ -78,13 +81,15 @@ class WebStreamServer: ObservableObject {
                     self.sendResponse(connection: connection, status: "204 No Content", contentType: "text/plain", body: Data())
                 }
             } else if path == "/start" || path == "/stop" {
+                // Idempotent: /start while capturing and /stop while idle are no-ops.
                 DispatchQueue.main.async {
-                    if path == "/start" { self.onStartScan?() } else { self.onStopScan?() }
+                    if path == "/start" { self.onStartScan?(source) } else { self.onStopScan?(source) }
                 }
                 self.sendResponse(connection: connection, status: "202 Accepted", contentType: "application/json", body: Data("{\"accepted\":true}".utf8))
             } else if path.hasPrefix("/toggle") {
+                // Legacy clients only; new clients use /start and /stop.
                 DispatchQueue.main.async {
-                    self.onToggleScan?()
+                    self.onToggleScan?(source)
                 }
                 let resp = self.getStatusJSON?().data(using: .utf8) ?? "{\"status\": \"toggled\"}".data(using: .utf8)!
                 self.sendResponse(connection: connection, contentType: "application/json", body: resp)
@@ -206,20 +211,20 @@ class WebStreamServer: ObservableObject {
             </header>
             <div class="main">
                 <div class="card">
-                    <div class="card-title"><span>Video TrueDepth en Vivo</span><span>30 FPS</span></div>
+                    <div class="card-title"><span>Video TrueDepth en Vivo</span><span>vista ligera</span></div>
                     <img id="liveView" alt="Cargando vídeo..." />
                 </div>
                 <div class="card">
-                    <div class="card-title"><span>Telemetría de Vértices Acumulados</span><span id="scanStatus">En Espera</span></div>
+                    <div class="card-title"><span>Captura en el iPhone</span><span id="scanStatus">En Espera</span></div>
                     <div class="stats-box">
                         <div class="metric" id="ptsCount">0</div>
-                        <div class="metric-label">Vértices 3D Registrados en Malla</div>
-                        <div style="font-size: 13px; color: #64748b; text-align: center;">Pulsa el botón o haz doble clic en volumen para Iniciar / Detener el escaneo continuo.</div>
+                        <div class="metric-label">Fotogramas grabados (sin reconstrucción en el teléfono)</div>
+                        <div style="font-size: 13px; color: #64748b; text-align: center;">La reconstrucción 3D se hace en Windows después de verificar la sesión.</div>
                     </div>
                 </div>
             </div>
             <div class="controls">
-                <button id="toggleBtn" class="btn-toggle" onclick="toggleScan()">Iniciar Escaneo Continuo</button>
+                <button id="toggleBtn" class="btn-toggle" onclick="toggleScan()">INICIAR CAPTURA</button>
                 <button class="btn-clear" onclick="clearScan()">Limpiar</button>
                 <a id="stlBtn" class="btn btn-stl" href="/model.stl" download="TrueDepth_CAD.stl">Descargar STL</a>
             </div>
@@ -233,32 +238,27 @@ class WebStreamServer: ObservableObject {
                 }
                 updateFrame();
 
+                let scanning = false;
                 async function pollStatus() {
                     try {
                         const res = await fetch('/status');
                         const data = await res.json();
-                        document.getElementById('ptsCount').innerText = data.points.toLocaleString();
-                        const isScanning = data.isScanning;
+                        scanning = !!data.isScanning;
+                        document.getElementById('ptsCount').innerText = (data.frames || 0).toLocaleString();
+                        document.getElementById('statusText').innerText = data.status || '';
                         const btn = document.getElementById('toggleBtn');
                         const statusLabel = document.getElementById('scanStatus');
-                        if (isScanning) {
-                            btn.innerText = 'DETENER ESCANEO Y GENERAR STL';
-                            btn.style.background = '#ef4444';
-                            statusLabel.innerText = '● Grabando en vivo';
-                            statusLabel.style.color = '#ef4444';
-                        } else {
-                            btn.innerText = 'INICIAR ESCANEO CONTINUO';
-                            btn.style.background = '#0284c7';
-                            statusLabel.innerText = data.points > 0 ? 'Malla Lista' : 'En Espera';
-                            statusLabel.style.color = '#10b981';
-                        }
+                        btn.disabled = !!data.busy;
+                        btn.innerText = scanning ? 'FINALIZAR CAPTURA' : 'INICIAR CAPTURA';
+                        btn.style.background = scanning ? '#ef4444' : '#0284c7';
+                        statusLabel.innerText = data.phase || '';
                     } catch(e) {}
                     setTimeout(pollStatus, 500);
                 }
                 pollStatus();
 
                 async function toggleScan() {
-                    await fetch('/toggle');
+                    await fetch(scanning ? '/stop?src=web' : '/start?src=web');
                 }
                 async function clearScan() {
                     await fetch('/clear');

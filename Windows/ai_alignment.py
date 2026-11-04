@@ -32,8 +32,10 @@ def robust_pose(source,target,threshold=.004):
 
 
 class NeuralMatcher:
-    def __init__(self):
+    def __init__(self,require_cuda=False):
         import torch
+        if require_cuda and not torch.cuda.is_available():
+            raise RuntimeError('LoFTR: PyTorch no ve CUDA; no se usa CPU en silencio. Desactiva LoFTR o revisa el controlador.')
         from kornia.feature import LoFTR
         directory=Path(__file__).resolve().parent/'.models'; directory.mkdir(exist_ok=True)
         path=directory/'loftr_outdoor.ckpt'; checksum=directory/'loftr_outdoor.sha256'
@@ -71,9 +73,9 @@ class NeuralMatcher:
 
 
 _matcher=None
-def neural_seed(current,previous,intrinsics,previous_intrinsics):
+def neural_seed(current,previous,intrinsics,previous_intrinsics,require_cuda=False):
     global _matcher
-    if _matcher is None: _matcher=NeuralMatcher()
+    if _matcher is None or (require_cuda and _matcher.device!='cuda'): _matcher=NeuralMatcher(require_cuda)
     return _matcher.seed(current,previous,intrinsics,previous_intrinsics)
 
 

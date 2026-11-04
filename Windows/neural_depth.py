@@ -30,13 +30,16 @@ def network():
     return ResidualUNet()
 
 class DepthDenoiser:
-    def __init__(self,path=None):
+    def __init__(self,path=None,require_cuda=False):
         import torch
         path=Path(path) if path else Path(__file__).resolve().parent/'models'/MODEL_NAME
         card=json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))
         if hashlib.sha256(path.read_bytes()).hexdigest()!=card['sha256']:
             raise ValueError('Pesos de limpieza neuronal alterados')
         if card.get('architecture')!='residual-unet-v1': raise ValueError('Arquitectura neuronal desconocida')
+        if require_cuda and not torch.cuda.is_available():
+            # RTX + IA was requested: never fall back to CPU silently.
+            raise RuntimeError(f'PyTorch {torch.__version__} no ve CUDA (compilado para CUDA {torch.version.cuda}). Revisa el controlador NVIDIA o usa RTX sola.')
         self.device='cuda' if torch.cuda.is_available() else 'cpu'; self.torch=torch
         self.model=network().to(self.device).eval()
         self.model.load_state_dict(torch.load(path,map_location=self.device,weights_only=True))
@@ -54,10 +57,8 @@ class DepthDenoiser:
 
 _denoiser=None
 
-def denoise_depth(depth,rgb,path=None):
+def denoise_depth(depth,rgb,path=None,require_cuda=False):
     global _denoiser
-
-    if _denoiser is None or getattr(_denoiser,"source",None)!=path:
-
-        _denoiser=DepthDenoiser(path); _denoiser.source=path
+    if _denoiser is None or getattr(_denoiser,"source",None)!=path or (require_cuda and _denoiser.device!='cuda'):
+        _denoiser=DepthDenoiser(path,require_cuda); _denoiser.source=path
     return _denoiser.denoise(depth,rgb)

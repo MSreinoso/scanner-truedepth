@@ -5,20 +5,40 @@ import CryptoKit
 /// Append-only native depth/BGRA records. No JPEG, fusion, or compression here.
 final class CaptureRecorder {
     static let header = Data("B3DREC02".utf8)
-    private var file: FileHandle?
     private(set) var url: URL?
     private(set) var count = 0
     private(set) var bytes: UInt64 = 0
 
+    /// Tests may redirect storage; production always uses Documents/Scans.
+    static var overrideDirectory: URL?
     static var directory: URL {
-        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let folder = base.appendingPathComponent("Scans", isDirectory: true)
+        let folder = overrideDirectory ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Scans", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         return folder
     }
 
     private var codec = LosslessFrameCodec()
-    static let cacheLimit: UInt64 = 180_000_000
+    /// Phone-side cache for blocks not yet confirmed by Windows. This bounds the
+    /// local backlog only; a complete session may be much larger on Windows.
+    static var cacheLimit: UInt64 = 180_000_000
+
+    /// Raised instead of writing when unconfirmed blocks would exceed the cache.
+    /// Pending blocks are never overwritten or discarded to make room.
+    struct CacheFull: LocalizedError {
+        let pending: UInt64
+        var errorDescription: String? {
+            "Caché del iPhone llena: \(pending / 1_000_000) MB esperan confirmación de Windows (límite \(CaptureRecorder.cacheLimit / 1_000_000) MB)."
+        }
+    }
+
+    struct PendingSummary {
+        var bytes: UInt64 = 0
+        var sessions = 0
+        var rejected = 0
+        var legacyBytes: UInt64 = 0
+        var legacyFiles = 0
+    }
 
     static func sealInterruptedSessions() {
         let folders = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
@@ -47,47 +67,101 @@ final class CaptureRecorder {
         }
     }
 
-    static func pendingBytes() -> UInt64 {
+    static func pendingBytes(excluding excluded: URL? = nil) -> UInt64 {
         let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.fileSizeKey])
         var total: UInt64 = 0
+        let skip = excluded?.standardizedFileURL.path
         while let url = files?.nextObject() as? URL {
             guard url.pathExtension == "b3dc" || url.lastPathComponent.hasSuffix(".b3dc.pending") else { continue }
+            if let skip = skip, url.deletingLastPathComponent().standardizedFileURL.path == skip { continue }
             total += UInt64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
         return total
     }
 
+    /// Unconfirmed v3 sessions plus legacy v2 archives that no longer upload.
+    static func summary() -> PendingSummary {
+        var result = PendingSummary()
+        let entries = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey])) ?? []
+        for entry in entries {
+            let isFolder = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if isFolder {
+                let manifest = entry.appendingPathComponent("session.json")
+                guard FileManager.default.fileExists(atPath: manifest.path) else { continue }
+                result.sessions += 1
+                if let data = try? Data(contentsOf: manifest),
+                   let value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], value["rejected"] != nil {
+                    result.rejected += 1
+                }
+                let files = (try? FileManager.default.contentsOfDirectory(at: entry, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+                for file in files where file.pathExtension == "b3dc" || file.lastPathComponent.hasSuffix(".b3dc.pending") {
+                    result.bytes += UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+                }
+            } else if ["b3draw", "b3dz", "partial"].contains(entry.pathExtension) {
+                result.legacyFiles += 1
+                result.legacyBytes += UInt64((try? entry.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            }
+        }
+        return result
+    }
+
+    /// User-confirmed only: removes sessions Windows never confirmed and v2 archives.
+    static func discardPending(except active: URL?) -> UInt64 {
+        var freed: UInt64 = 0
+        let keep = active?.standardizedFileURL.path
+        let entries = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+        for entry in entries where entry.standardizedFileURL.path != keep {
+            if let walker = FileManager.default.enumerator(at: entry, includingPropertiesForKeys: [.fileSizeKey]) {
+                while let file = walker.nextObject() as? URL { freed += UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+            }
+            freed += UInt64((try? entry.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            try? FileManager.default.removeItem(at: entry)
+        }
+        return freed
+    }
+
     func start() throws {
-        let folder = Self.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let folder = Self.directory.appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         url = folder; count = 0; bytes = 0; codec = LosslessFrameCodec()
         try writeManifest(finished: false, dropped: 0)
     }
 
-    private func writeManifest(finished: Bool, dropped: Int) throws {
+    private func writeManifest(finished: Bool, dropped: Int, reason: String? = nil) throws {
         guard let folder = url else { throw CocoaError(.fileWriteUnknown) }
-        let data = try JSONSerialization.data(withJSONObject: ["version": 3, "session": folder.lastPathComponent,
-            "frames": count, "dropped": dropped, "finished": finished])
+        var value: [String: Any] = ["version": 3, "session": folder.lastPathComponent,
+            "frames": count, "dropped": dropped, "finished": finished]
+        if let reason = reason, !reason.isEmpty { value["stopReason"] = reason }
+        let data = try JSONSerialization.data(withJSONObject: value)
         try data.write(to: folder.appendingPathComponent("session.json"), options: .atomic)
     }
 
     func append(_ packet: Data) throws {
         guard let folder = url else { throw CocoaError(.fileWriteUnknown) }
         let encoded = try codec.encode(packet)
-        guard Self.pendingBytes() + UInt64(encoded.count) < Self.cacheLimit else {
-            throw NSError(domain: "Bichito3D", code: 2, userInfo: [NSLocalizedDescriptionKey: "Caché llena por desconexión. Captura detenida sin sobrescribir pendientes."])
+        let pending = Self.pendingBytes()
+        guard pending + UInt64(encoded.count) < Self.cacheLimit else {
+            // The skipped frame must not become the reference of a later repeat block.
+            codec = LosslessFrameCodec()
+            throw CacheFull(pending: pending)
         }
         let path = folder.appendingPathComponent(String(format: "%09d.b3dc", count))
-        let pending = path.appendingPathExtension("pending")
-        try encoded.write(to: pending, options: .atomic)
-        let handle = try FileHandle(forWritingTo: pending)
-        try handle.synchronize(); try handle.close()
+        let partial = path.appendingPathExtension("pending")
+        do {
+            try encoded.write(to: partial, options: .atomic)
+            let handle = try FileHandle(forWritingTo: partial)
+            try handle.synchronize(); try handle.close()
+            try FileManager.default.moveItem(at: partial, to: path)
+        } catch {
+            try? FileManager.default.removeItem(at: partial)
+            codec = LosslessFrameCodec()
+            throw error
+        }
         count += 1; bytes += UInt64(encoded.count)
         try writeManifest(finished: false, dropped: 0)
-        try FileManager.default.moveItem(at: pending, to: path)
     }
 
-    func finish(dropped: Int) throws -> URL {
+    func finish(dropped: Int, reason: String? = nil) throws -> URL {
         if let folder = url {
             for file in try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) where file.lastPathComponent.hasSuffix(".b3dc.pending") {
                 let destination = file.deletingPathExtension()
@@ -95,7 +169,7 @@ final class CaptureRecorder {
                 if let seq = Int(file.lastPathComponent.components(separatedBy: ".")[0]) { count = max(count, seq + 1) }
             }
         }
-        try writeManifest(finished: true, dropped: dropped)
+        try writeManifest(finished: true, dropped: dropped, reason: reason)
         guard let url = url else { throw CocoaError(.fileWriteUnknown) }
         return url
     }
@@ -143,5 +217,4 @@ final class CaptureRecorder {
         return (outputURL, hash.finalize().map { String(format: "%02x", $0) }.joined())
     }
 
-    deinit { try? file?.close() }
 }

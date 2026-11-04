@@ -15,6 +15,12 @@ def run(destination):
         vertices,_=tile.mesh(2);assert len(vertices)>0
         np.testing.assert_allclose(vertices[:,:,2],.3,atol=1e-6)
         result['cuda_triangles']=len(vertices)
+        lod,_=tile.mesh(2,4);assert len(lod)>0 and len(lod)<len(vertices)
+        from mesh_view import weld,ViewMesh,Camera,GpuRenderer
+        V,F,N,C=weld(vertices,quantum=1e-6,xp=cp);view=ViewMesh(V,F,N,None,'diagnóstico',len(vertices))
+        renderer=GpuRenderer();renderer.upload(view);camera=Camera();camera.frame(view)
+        image=renderer.render(camera,160,120,False);assert image.shape==(120,160,3)
+        result['viewer']={'renderer':renderer.name,'faces':int(len(F)),'lod_triangles':int(len(lod))}
         from cuda_registration import register
         from offline_pipeline import Settings
         ok,pose,fitness,rmse=register(depth+.001,depth,[120,120,16,16],[120,120,16,16],np.eye(4),Settings())
@@ -27,7 +33,7 @@ def run(destination):
         root=tk.Tk();root.withdraw()
         try:
             app=OfflineStudio.__new__(OfflineStudio);app.root=root;app.ip=tk.StringVar()
-            app.status=tk.StringVar();app.quality=tk.DoubleVar(value=.5);app.params={};app.cancel=threading.Event()
+            app.status=tk.StringVar();app.quality=tk.DoubleVar(value=.05);app.params={};app.cancel=threading.Event()
             app.build_ui();root.update_idletasks()
             assert app.model_choice.get();assert app.reconstruction_mode.get()=='RTX sola'
             result['ui']=True

@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import zlib
 import numpy as np
 from offline_pipeline import (HEADER, RAW_MAGIC, Settings, decode_frame, records,
-    validate_session, receive_archive, relative_rotation, TensorFusion, reconstruct, StableViewer)
+    validate_session, receive_archive, relative_rotation, TensorFusion, reconstruct, export_selected)
 
 
 def raw_packet(index=0,width=24,height=24):
@@ -101,14 +101,35 @@ class SessionTests(unittest.TestCase):
         angle=.8; R=np.array([[np.cos(angle),-np.sin(angle),0],[np.sin(angle),np.cos(angle),0],[0,0,1]])
         np.testing.assert_allclose(relative_rotation(R,R),np.eye(3),atol=1e-12)
 
-    def test_viewer_render_preserves_manual_view(self):
-        viewer=object.__new__(StableViewer)
-        viewer.points=np.array([[0.,0.,0.],[1.,1.,1.]])
-        viewer.colors=np.ones((2,3)); viewer.radius=2.; viewer.yaw=.4; viewer.pitch=.2; viewer.zoom=1.3
-        for name in ('delete','create_oval','create_text'): setattr(viewer,name,Mock())
-        viewer.winfo_width=lambda:600; viewer.winfo_height=lambda:400
-        viewer.render(); viewer.render()
-        self.assertEqual((viewer.yaw,viewer.pitch,viewer.zoom),(.4,.2,1.3))
+    def test_viewer_draws_solid_triangles_and_keeps_manual_camera(self):
+        from mesh_view import weld,ViewMesh,Camera,CpuRenderer
+        # Closed box as a triangle soup with duplicated corners (as Marching Cubes emits).
+        corners=np.array([[x,y,z] for x in (-.02,.02) for y in (-.02,.02) for z in (.28,.32)],np.float32)
+        quads=[(0,1,3,2),(4,6,7,5),(0,4,5,1),(2,3,7,6),(0,2,6,4),(1,5,7,3)]
+        soup=np.array([[corners[a],corners[b],corners[c]] for q in quads for a,b,c in ((q[0],q[1],q[2]),(q[0],q[2],q[3]))])
+        V,F,N,C=weld(soup,quantum=1e-6)
+        self.assertEqual((len(V),len(F)),(8,12))
+        mesh=ViewMesh(V,F,N,None,'test',12)
+        camera=Camera(); camera.frame(mesh); camera.orbit(60,-40); camera.zoom_by(1.3)
+        renderer=CpuRenderer(); renderer.upload(mesh)
+        image=renderer.render(camera,200,150,use_color=False)
+        covered=(np.abs(image.astype(int)-[20,26,38]).sum(2)>30).mean()
+        self.assertGreater(covered,.15)   # a filled surface, not sparse points
+        state=(camera.yaw,camera.pitch,camera.zoom)
+        renderer.render(camera,200,150); camera.frame(mesh,keep=True)
+        self.assertEqual((camera.yaw,camera.pitch,camera.zoom),state)
+        camera.frame(mesh,keep=False); self.assertEqual((camera.yaw,camera.pitch,camera.zoom),(0.,0.,1.))
+
+    def test_stl_export_is_verified_against_selected_result(self):
+        class Fake:
+            triangles=[0,1,2]
+            def export_mm(self,path):
+                Path(path).write_bytes(b'\0'*80+struct.pack('<I',3)+b'\0'*150)
+        target=self.folder/'a.stl'
+        self.assertEqual(export_selected(Fake(),target),3)
+        class Wrong(Fake):
+            triangles=[0,1]
+        with self.assertRaises(ValueError): export_selected(Wrong(),target)
 
 
 try:

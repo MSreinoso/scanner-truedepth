@@ -10,12 +10,13 @@ class ModelTests(unittest.TestCase):
         studio=OfflineStudio.__new__(OfflineStudio);studio.busy=False
         first,second=object(),object()
         studio.results={'RTX sola':(first,{'triangles':10}),'RTX + IA':(second,{'triangles':20})}
-        studio.viewer=Mock();studio.status=Mock();studio.result_choice=Mock()
+        studio.viewer=Mock();studio.status=Mock();studio.result_choice=Mock();studio.show_report=Mock();studio.update_steps=Mock()
+        studio.export_stl=Mock();studio.export_ply=Mock()
         studio.result_choice.get.return_value='RTX sola';studio.select_result()
         self.assertIs(studio.mesh,first)
         studio.result_choice.get.return_value='RTX + IA';studio.select_result()
         self.assertIs(studio.mesh,second)
-        studio.viewer.set_mesh.assert_called_with(second)
+        studio.viewer.set_mesh.assert_called_with(second,keep_camera=True)
 
     def test_default_persists_and_corruption_rejected(self):
         with tempfile.TemporaryDirectory() as folder,patch.dict(os.environ,{'LOCALAPPDATA':folder}):
