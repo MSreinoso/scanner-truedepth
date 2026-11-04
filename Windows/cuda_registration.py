@@ -15,6 +15,7 @@ def vertices(depth, intrinsics):
 
 
 def register(depth, previous_depth, intrinsics, previous_intrinsics, initial, settings):
+    register.last_detail={}
     cp=cuda_module()
     transform=cp.asarray(initial,dtype=cp.float64)
     target=vertices(previous_depth,previous_intrinsics)
@@ -70,7 +71,16 @@ def register(depth, previous_depth, intrinsics, previous_intrinsics, initial, se
             if float(cp.linalg.norm(update))<1e-7: break
     points=source.reshape(-1,3);points=points[points[:,2]>0]
     p,q,n,squared=correspond(points,settings.correspondence_mm/1000)
-    fitness=len(p)/max(1,len(points));rmse=float(cp.sqrt(cp.mean(squared))) if len(p) else float('inf')
+    fitness=len(p)/max(1,len(points))
+    # Quality = point-to-plane residual (what ICP minimizes). Point-to-point
+    # distance also counts sliding along the surface and grows with the
+    # sensor's millimetric noise, which rejected valid real TrueDepth frames.
+    if len(p):
+        plane=cp.abs(cp.sum(n*(p-q),axis=1))
+        rmse=float(cp.sqrt(cp.mean(plane**2)))
+        register.last_detail={'point_to_point_rmse_mm':float(cp.sqrt(cp.mean(squared)))*1000,
+                              'point_to_plane_median_mm':float(cp.median(plane))*1000}
+    else: rmse=float('inf')
     pose=cp.asnumpy(transform)
     angle=np.degrees(np.arccos(np.clip((np.trace(pose[:3,:3])-1)/2,-1,1)))
     valid=bool(np.isfinite(pose).all() and fitness>=settings.min_fitness and rmse<=settings.max_rmse_mm/1000 and np.linalg.norm(pose[:3,3])<=.1 and angle<=45)

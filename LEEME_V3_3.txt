@@ -1,0 +1,72 @@
+Bichito 3D — versión 3.3 (entrega nueva)
+
+ARCHIVOS NUEVOS
+- Bichito3D-Unificado-v3.3.exe : app de Windows única (CUDA, IA, modelos y dependencias incluidas).
+- Bichito3D.lnk                 : acceso directo, ahora apunta a la 3.3.
+- Bichito3D-iPhone-v3.3.ipa     : app del iPhone, versión 3.3 build 7 (instalar con Sideloadly).
+Las versiones anteriores (3.2, 3.1, 3.0, 2.0...) se conservan en la misma carpeta como respaldo.
+Cierra cualquier versión anterior antes de abrir la 3.3 (usan los mismos puertos).
+El primer arranque del .exe extrae ~5 GB de bibliotecas y puede tardar 1-2 minutos.
+La primera reconstrucción compila los kernels CUDA (~1 min extra); después quedan en caché.
+
+CAUSA ENCONTRADA DEL FALLO "LA CAPTURA SE CANCELA AL INICIAR"
+El iPhone nombraba cada sesión con un UUID en MAYÚSCULAS. Windows respondía con el mismo
+UUID en minúsculas y el iPhone comparaba el texto exacto: rechazaba todas las respuestas,
+nunca recibía confirmación y nunca liberaba un bloque. La caché del iPhone (180 MB) se llenaba
+con la primera captura, y en las siguientes el primer fotograma ya no cabía: la captura se
+cancelaba con todos los contadores a cero y el mensaje genérico "No se obtuvieron frames TrueDepth".
+Esto concuerda con tus síntomas, pero aún no se ha comprobado en tu iPhone.
+Corrección: UUID en minúsculas, comparación sin distinguir mayúsculas, Windows devuelve el texto
+exacto que recibió, y las sesiones antiguas en mayúsculas que ya están en tu iPhone se envían igual.
+
+QUÉ VERÁS AL ABRIR LA 3.3 EN EL IPHONE
+- Si había capturas antiguas pendientes, se enviarán solas en cuanto Windows 3.3 esté abierto
+  en la misma red. La tarjeta "Transferencia a Windows" muestra los MB pendientes.
+- Si la caché sigue llena, "Iniciar captura" no arranca y dice por qué (MB y sesiones pendientes).
+  Puedes esperar a que se envíen o descartarlas con "Sesiones pendientes…" (pide confirmación).
+- Estados diferenciados: esperando al sensor, capturando, pausa por red (caché llena),
+  fallo de almacenamiento, interrupción de cámara, parada pedida por ti, por Windows o por volumen.
+  Windows muestra los mismos estados en la pestaña Captura.
+
+FLUJO EN WINDOWS
+1 Conectar → 2 Capturar → 3 Verificar transferencia → 4 Reconstruir/comparar → 5 Inspeccionar malla → 6 Exportar
+- La IP del iPhone aparece en grande en el teléfono; si el descubrimiento automático no la encuentra,
+  escríbela en Windows y pulsa Conectar. La IP del PC aparece debajo del campo.
+- Modo Simple: cuatro calidades. Modo Avanzado: resolución exacta, distancias, ICP, mosaico, memoria,
+  opciones de IA y gestor de modelos.
+- Visor: superficie sólida sombreada (triángulos reales, renderizada en la RTX).
+  Arrastrar = girar; clic derecho o Shift+arrastrar = desplazar; rueda = zoom; doble clic = restablecer.
+  No gira solo. "⇄ Alternar" cambia entre RTX sola y RTX + IA manteniendo el encuadre.
+  Para modelos muy densos muestra un nivel de detalle del mismo TSDF (lo indica arriba);
+  el STL/PLY exportado es siempre la malla completa del resultado seleccionado.
+- Exportar STL (mm) / PLY con color (mm): el archivo se relee y se comprueba que tiene
+  exactamente los triángulos del resultado seleccionado.
+
+CORRECCIONES HECHAS CON TU CAPTURA REAL (sesión b11879c2, 691 fotogramas del 18/10)
+- Antes: la alineación rechazaba casi todo (8 de 691 aceptados). La métrica de calidad medía
+  distancia punto-a-punto (≈3-4 mm con el ruido real de TrueDepth) y el umbral era 3 mm.
+  Ahora se mide el error punto-a-plano (lo que minimiza el ICP): 1,4-2,2 mm en tu captura.
+  Resultado: 622 aceptados, 69 rechazados. La versión 3.2 tenía el mismo problema.
+- Recuperación: si falla contra el keyframe, prueba el fotograma anterior y keyframes recientes.
+- Fusión TSDF: un solo lanzamiento CUDA por mosaico para todos los fotogramas visibles
+  (antes un bucle Python por fotograma); resultado idéntico bit a bit, mucho más rápido.
+- Filtro guiado por RGB ahora en la RTX; mapa de distorsión de lente calculado una sola vez.
+- Botón "Cancelar procesado" podía ignorar el clic (se reaplicaba su estado cada 100 ms). Corregido.
+- Panel izquierdo recortaba textos y opciones. Corregido y cubierto por prueba automática.
+- Visor: botón "Rotar 90°" (el sensor graba en horizontal; elige qué lado es arriba).
+Pendiente: la reconstrucción real deja fragmentos sueltos en zonas vistas pocas veces
+(hombros, fondo). Subir "Observaciones mínimas" en Avanzado los reduce; no se eliminan solos.
+
+RESOLUCIÓN Y PRECISIÓN
+0,05 mm es el tamaño de vóxel (muestreo) de la reconstrucción, no la precisión del sensor.
+TrueDepth tiene ruido del orden de milímetros a 20-40 cm; ninguna resolución de salida lo elimina.
+
+IA
+- RTX sola: sin redes neuronales.
+- RTX + IA: limpieza neuronal de profundidad con el modelo seleccionado (UNet residual propia,
+  entrenada con NYU Depth V2 + ruido sintético). NO está validada con un TrueDepth real.
+  En la prueba sintética redujo el error medio, pero dejó un rayado leve alineado con los píxeles:
+  compáralo visualmente con RTX sola antes de elegir cuál exportar.
+- LoFTR (opcional, Avanzado) es otra cosa: alineación por correspondencias RGB, no limpia profundidad.
+- "Limpieza guiada por RGB" es un filtro clásico, no IA.
+- Si eliges RTX + IA y PyTorch no ve CUDA, se detiene con un diagnóstico; no pasa a CPU en silencio.

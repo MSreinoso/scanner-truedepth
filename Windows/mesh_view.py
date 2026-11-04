@@ -97,6 +97,7 @@ class Camera:
 
     def __init__(self):
         self.reference=None   # (center, radius) kept while comparing results
+        self.roll=0.          # TrueDepth records in landscape; the user picks 'up'
         self.reset()
 
     def reset(self):
@@ -111,7 +112,12 @@ class Camera:
         cy,sy=math.cos(self.yaw),math.sin(self.yaw); cp,sp=math.cos(self.pitch),math.sin(self.pitch)
         Ry=np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]]); Rx=np.array([[1,0,0],[0,cp,-sp],[0,sp,cp]])
         # TrueDepth camera axes (x right, y down, z forward) -> viewer looking from the phone.
-        return Rx@Ry@np.diag([1.,-1.,-1.])
+        cr,sr=math.cos(self.roll),math.sin(self.roll)
+        Rz=np.array([[cr,-sr,0],[sr,cr,0],[0,0,1]])
+        return Rx@Ry@Rz@np.diag([1.,-1.,-1.])
+
+    def roll_by(self,quarter_turns):
+        self.roll=(self.roll+quarter_turns*math.pi/2)%(2*math.pi)
 
     def distance(self):
         _,radius=self.reference

@@ -60,6 +60,38 @@ extern "C" __global__ void integrate(float* field, float* weights, float* colors
 }
 '''
 
+INTEGRATE_MANY=r'''
+extern "C" __global__ void integrate_many(float* field, float* weights, float* colors,
+ const unsigned long long* depth_ptrs, const unsigned long long* rgb_ptrs, const float* E, const float* K,
+ const int* sizes, int count, int side, float ox, float oy, float oz, float voxel, float truncation) {
+ // Same arithmetic and frame order as `integrate`, one launch for all visible frames.
+ int i=blockDim.x*blockIdx.x+threadIdx.x, total=side*side*side;
+ if(i>=total) return;
+ int x=i%side,y=(i/side)%side,z=i/(side*side);
+ float wx=ox+x*voxel,wy=oy+y*voxel,wz=oz+z*voxel;
+ float f=field[i],w=weights[i],c0=colors[3*i],c1=colors[3*i+1],c2=colors[3*i+2];
+ for(int k=0;k<count;k++){
+  const float* e=E+12*k; const float* q=K+4*k;
+  float px=e[0]*wx+e[1]*wy+e[2]*wz+e[3];
+  float py=e[4]*wx+e[5]*wy+e[6]*wz+e[7];
+  float pz=e[8]*wx+e[9]*wy+e[10]*wz+e[11];
+  if(pz<=0) continue;
+  int width=sizes[2*k],height=sizes[2*k+1];
+  int u=__float2int_rn(q[0]*px/pz+q[2]),v=__float2int_rn(q[1]*py/pz+q[3]);
+  if(u<0||v<0||u>=width||v>=height) continue;
+  int pixel=v*width+u;
+  float d=((const float*)depth_ptrs[k])[pixel],sdf=d-pz;
+  if(!(d>0)||sdf < -truncation) continue;
+  const unsigned char* rgb=(const unsigned char*)rgb_ptrs[k];
+  float value=fminf(1.f,sdf/truncation);
+  f=(f*w+value)/(w+1.f);
+  c0=(c0*w+(float)rgb[3*pixel])/(w+1.f); c1=(c1*w+(float)rgb[3*pixel+1])/(w+1.f); c2=(c2*w+(float)rgb[3*pixel+2])/(w+1.f);
+  w=w+1.f;
+ }
+ field[i]=f; weights[i]=w; colors[3*i]=c0; colors[3*i+1]=c1; colors[3*i+2]=c2;
+}
+'''
+
 MARCH=r'''
 __device__ int corner(int cell,int c,int cells) {
  int side=cells+1,x=cell%cells,y=(cell/cells)%cells,z=cell/(cells*cells);
@@ -93,6 +125,12 @@ extern "C" __global__ void emit_triangles(const float* field,const float* colors
 '''
 
 
+_KERNELS={}
+def _kernel(code,name):
+    if (code,name) not in _KERNELS: _KERNELS[(code,name)]=cuda_module().RawKernel(code,name)
+    return _KERNELS[(code,name)]
+
+
 class CudaTile:
     def __init__(self,cells,voxel,origin):
         self.cp=cp=cuda_module(); self.cells=cells; self.voxel=voxel; self.origin=origin
@@ -100,6 +138,19 @@ class CudaTile:
         self.field=cp.ones(side**3,dtype=cp.float32); self.weights=cp.zeros(side**3,dtype=cp.float32)
         self.colors=cp.zeros((side**3,3),dtype=cp.float32)
         self.kernel=cp.RawKernel(INTEGRATE,'integrate')
+
+    def integrate_many(self,frames):
+        """frames: list of (gpu_depth, gpu_rgb, extrinsic 3x4 float32, intrinsics, width, height)."""
+        cp=self.cp
+        if not frames: return
+        kernel=_kernel(INTEGRATE_MANY,'integrate_many')
+        depth_ptrs=cp.asarray([f[0].data.ptr for f in frames],dtype=cp.uint64)
+        rgb_ptrs=cp.asarray([f[1].data.ptr for f in frames],dtype=cp.uint64)
+        E=cp.asarray(np.stack([f[2] for f in frames]).astype(np.float32))
+        K=cp.asarray(np.array([f[3] for f in frames],dtype=np.float32))
+        sizes=cp.asarray(np.array([(f[4],f[5]) for f in frames],dtype=np.int32))
+        kernel(((self.side**3+255)//256,),(256,),(self.field,self.weights,self.colors,depth_ptrs,rgb_ptrs,E,K,sizes,np.int32(len(frames)),
+            np.int32(self.side),*[np.float32(v) for v in self.origin],np.float32(self.voxel),np.float32(max(self.voxel*8,.002))))
 
     def integrate(self,depth,rgb,intrinsics,pose):
         cp=self.cp; h,w=depth.shape
@@ -222,8 +273,9 @@ def reconstruct_tiled(path,settings,progress,cancel):
     # Keyframe registration: each frame aligns to the current keyframe (not to
     # the previous frame), so small per-frame errors do not add up. A new
     # keyframe is taken when overlap drops or the motion grows.
-    key=None; last=None
-    accepted=[]; rejected=0; keyframes=0; fallback=0
+    from collections import deque
+    key=None; last=None; recent=deque(maxlen=6)
+    accepted=[]; frame_info=[]; rejected=0; keyframes=0; fallback=0
     for index,frame in enumerate(records(path)):
         if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; sesión original conservada')
         if index%settings.stride: continue
@@ -233,36 +285,45 @@ def reconstruct_tiled(path,settings,progress,cancel):
         candidate=np.eye(4); promote=key is None
         if valid and key is not None:
             imu=np.eye(4); imu[:3,:3]=relative_rotation(last['imu'],frame.rotation)
-            guess=np.linalg.inv(key['pose'])@last['pose']@imu
+            predicted=last['pose']@imu      # constant position + IMU rotation
+            seed=None
             if settings.neural_alignment:
                 from ai_alignment import neural_seed
                 seed=neural_seed((depth,rgb),key['images'],frame.intrinsics,key['intrinsics'],require_cuda=True)
-                if seed is not None: guess=seed
-            try: valid,delta,fitness,rmse=register(cloud,key['depth'],frame.intrinsics,key['intrinsics'],guess,settings)
-            except ValueError: valid=False
-            candidate=key['pose']@delta
-            if valid:
-                promote=(fitness<min(.95,settings.min_fitness+.2) or np.linalg.norm(delta[:3,3])>.02 or rotation_angle(delta)>10)
-            elif last is not key:
-                # Keyframe out of reach: try the immediately previous frame, then promote.
-                try: valid,delta,fitness,rmse=register(cloud,last['depth'],frame.intrinsics,last['intrinsics'],imu,settings)
-                except ValueError: valid=False
-                candidate=last['pose']@delta; promote=valid; fallback+=valid
+            # Current keyframe first; then the previous frame and recent
+            # keyframes, so a single bad frame or fast motion does not end tracking.
+            references=[key]+([last] if last is not key else [])+[k for k in reversed(recent) if k is not key][:3]
+            valid=False
+            for attempt,reference in enumerate(references):
+                guess=seed if (attempt==0 and seed is not None) else np.linalg.inv(reference['pose'])@predicted
+                try: ok,delta,fitness,rmse=register(cloud,reference['depth'],frame.intrinsics,reference['intrinsics'],guess,settings)
+                except ValueError: ok=False
+                if ok:
+                    valid=True; candidate=reference['pose']@delta
+                    if attempt==0:
+                        promote=(fitness<min(.95,settings.min_fitness+.2) or np.linalg.norm(delta[:3,3])>.02 or rotation_angle(delta)>10)
+                    else:
+                        promote=True; fallback+=1
+                    break
         if valid:
             frame_keys=surface_tile_keys(cloud,frame.intrinsics,candidate,width)
             keys=unique_tiles(cp.concatenate((keys,frame_keys)))
             current={'pose':candidate,'depth':cloud,'intrinsics':frame.intrinsics,'imu':frame.rotation,'images':(depth,rgb)}
             last=current
-            if promote: key=current; keyframes+=1
+            if promote:
+                key=current; keyframes+=1; recent.append(current)
             name=f'{index:09d}'
             np.save(inputs/(name+'-depth.npy'),depth);np.save(inputs/(name+'-rgb.npy'),rgb)
             accepted.append((name,candidate.copy(),frame.intrinsics.copy(),np.linalg.inv(candidate)))
+            positive=depth[depth>0]
+            frame_info.append(((float(positive.min()),float(positive.max())) if positive.size else (np.inf,-np.inf),depth.shape,depth.nbytes+rgb.nbytes))
         else: rejected+=1
         progress(index+1,metadata['frames'],len(accepted),rejected,'RTX · alineación ICP y localización de superficie (CUDA)',fitness,rmse)
     timings['alineacion_s']=round(clock()-t0,2); t1=clock()
     stages.append({'etapa':'Decodificación y rectificación RGB-D','dispositivo':'CPU'})
     stages.append({'etapa':'ICP punto-plano coarse-to-fine con keyframes','dispositivo':'CUDA'})
     stages.append({'etapa':'Localización de superficie en mosaicos','dispositivo':'CUDA'})
+    if settings.rgb_guidance: stages.append({'etapa':'Filtro bilateral guiado por RGB','dispositivo':'CUDA'})
     if settings.neural_denoising: stages.append({'etapa':'Limpieza neuronal de profundidad','dispositivo':'CUDA (PyTorch)'})
     if settings.neural_alignment: stages.append({'etapa':'Semilla de alineación LoFTR','dispositivo':'CUDA (PyTorch)'})
     if len(accepted)<2: raise ValueError(f'Pocos frames alineados para reconstruir ({len(accepted)} aceptados, {rejected} rechazados). Revisa distancia, movimiento y parámetros ICP.')
@@ -273,7 +334,7 @@ def reconstruct_tiled(path,settings,progress,cancel):
     lods={k:([],[],0) for k in LOD_STRIDES if cells%k==0}
     from collections import OrderedDict
     cache=OrderedDict();cache_bytes=0
-    cache_limit=min(settings.memory_mb*1024**2//2,cp.cuda.runtime.memGetInfo()[0]//4)
+    cache_limit=max(64*1024**2,min(settings.memory_mb*1024**2,cp.cuda.runtime.memGetInfo()[0]//3))
     def prepared(name):
         nonlocal cache_bytes
         if name in cache:
@@ -281,26 +342,38 @@ def reconstruct_tiled(path,settings,progress,cancel):
         depth=np.load(inputs/(name+'-depth.npy'));rgb=np.load(inputs/(name+'-rgb.npy'))
         size=depth.nbytes+rgb.nbytes
         while cache and cache_bytes+size>cache_limit:
-            _,old=cache.popitem(last=False);cache_bytes-=old[0].nbytes+old[1].nbytes
-        value=(depth,rgb,cp.asarray(depth),cp.asarray(rgb))
+            _,old=cache.popitem(last=False);cache_bytes-=old[2].nbytes+old[3].nbytes
+        value=(None,None,cp.asarray(depth),cp.asarray(rgb))
         cache[name]=value;cache_bytes+=size
         return value
-    peak=0
+    # Vectorized visibility: one matrix product per tile for all frames.
+    inverses=np.stack([entry[3] for entry in accepted])                 # (N,4,4) world->camera
+    intrinsics_all=np.array([entry[2] for entry in accepted],dtype=np.float64)
+    extrinsics=inverses[:,:3,:].astype(np.float32)
+    depth_range=np.array([info[0] for info in frame_info]); frame_bytes=[info[2] for info in frame_info]
+    shapes=np.array([info[1] for info in frame_info]); heights,widths=shapes[:,0],shapes[:,1]
+    peak=0; launches=0
     for tile_index,tile_key in enumerate(keys):
         if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; mosaicos terminados y originales conservados')
         origin=tile_key.astype(np.float64)*width; center=origin+width/2; radius=math.sqrt(3)*width/2+.004
         tile=CudaTile(cells,voxel,origin)
-        for name,pose,intrinsics,inverse in accepted:
-            point=inverse@np.r_[center,1.]
-            if point[2]<=0: continue
-            depth,rgb,gpu_depth,gpu_rgb=prepared(name); h,w=depth.shape; fx,fy,cx,cy=intrinsics
-            u,v=fx*point[0]/point[2]+cx,fy*point[1]/point[2]+cy
-            margin=max(fx,fy)*radius/point[2]
-            if u+margin<0 or v+margin<0 or u-margin>=w or v-margin>=h: continue
-            crop=depth[max(0,int(v-margin)):min(h,int(v+margin)+2),max(0,int(u-margin)):min(w,int(u+margin)+2)]
-            valid=crop[crop>0]
-            if len(valid)==0 or valid.min()>point[2]+radius or valid.max()<point[2]-radius: continue
-            tile.integrate(gpu_depth,gpu_rgb,intrinsics,pose)
+        point=inverses[:,:3,:3]@center+inverses[:,:3,3]
+        z=point[:,2]; safe=np.maximum(z,1e-9)
+        u=intrinsics_all[:,0]*point[:,0]/safe+intrinsics_all[:,2]; v=intrinsics_all[:,1]*point[:,1]/safe+intrinsics_all[:,3]
+        margin=np.maximum(intrinsics_all[:,0],intrinsics_all[:,1])*radius/safe
+        visible=np.flatnonzero((z>0)&(u+margin>=0)&(v+margin>=0)&(u-margin<widths)&(v-margin<heights)
+                               &(depth_range[:,0]<=z+radius)&(depth_range[:,1]>=z-radius))
+        # Chunks bounded by the GPU image cache; order preserved (deterministic).
+        start=0
+        while start<len(visible):
+            chunk=[]; used=0
+            while start<len(visible) and (not chunk or used+frame_bytes[visible[start]]<=cache_limit):
+                chunk.append(visible[start]); used+=frame_bytes[visible[start]]; start+=1
+            frames=[]
+            for k in chunk:
+                _,_,gpu_depth,gpu_rgb=prepared(accepted[k][0])
+                frames.append((gpu_depth,gpu_rgb,extrinsics[k],accepted[k][2],int(widths[k]),int(heights[k])))
+            tile.integrate_many(frames); launches+=1
         minimum=max(1.,settings.min_observations)
         vertices,colors=tile.mesh(minimum)
         if len(vertices):
@@ -334,7 +407,7 @@ def reconstruct_tiled(path,settings,progress,cancel):
             'device':'CUDA: ICP + localización + TSDF + Marching Cubes',
             'gpu_name':cp.cuda.runtime.getDeviceProperties(0)['name'].decode(),
             'stages':stages,'cpu_tasks':['decodificación y rectificación RGB-D','selección de vistas por mosaico (escalares)','E/S de disco'],
-            'vram_pool_peak_mb':round(peak/1024**2,1),'timings':timings,
+            'vram_pool_peak_mb':round(peak/1024**2,1),'timings':timings,'fusion_kernel_launches':launches,
             'registration':'CUDA projective point-to-plane coarse-to-fine, alineación a keyframe',
             'resolution_note':'resolution_mm es el tamaño de vóxel de la reconstrucción, no la precisión física del sensor TrueDepth.',
             'vertices':total*3,'triangles':total,'tiles':len(keys),'view_levels':saved,'folder':str(folder)}

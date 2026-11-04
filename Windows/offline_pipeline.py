@@ -104,6 +104,47 @@ def align_cloud(current,previous,previous_imu,current_imu,settings,initial=None)
     return valid,transform,last.fitness,last.inlier_rmse
 
 
+_MAPS={}
+
+
+def _undistort_maps(w,h,reference,center,table):
+    """Lens-table remap grid; identical for every frame of a calibration, so cached."""
+    key=(w,h,reference.tobytes(),center.tobytes(),table.tobytes())
+    if key not in _MAPS:
+        if len(_MAPS)>8: _MAPS.clear()
+        c=center/reference*[w,h]
+        u,v=np.meshgrid(np.arange(w,dtype=np.float32),np.arange(h,dtype=np.float32))
+        radius=np.hypot(u-c[0],v-c[1])
+        max_radius=np.hypot(max(c[0],w-c[0]),max(c[1],h-c[1]))
+        magnification=np.interp(radius,np.linspace(0,max_radius,len(table)),table)
+        _MAPS[key]=((u+(u-c[0])*magnification).astype(np.float32),(v+(v-c[1])*magnification).astype(np.float32))
+    return _MAPS[key]
+
+
+def rgb_guided_filter(depth,rgb,cuda=False):
+    """Joint bilateral 3x3 guided by RGB (classic filter, not AI). Runs on the
+    RTX when CUDA is selected; identical formula on CPU otherwise."""
+    if cuda:
+        from gpu_backend import cuda_module
+        xp=cuda_module()
+    else: xp=np
+    safe=xp.asarray(depth,dtype=xp.float32); color=xp.asarray(rgb,dtype=xp.float32)
+    total=safe.copy(); weight=(safe>0).astype(xp.float32)
+    for dy in (-1,0,1):
+        for dx in (-1,0,1):
+            if not dx and not dy: continue
+            neighbor=xp.roll(safe,(dy,dx),(0,1)); other=xp.roll(color,(dy,dx),(0,1))
+            valid_neighbor=(neighbor>0)&(safe>0)
+            if dy>0: valid_neighbor[:dy]=False
+            if dy<0: valid_neighbor[dy:]=False
+            if dx>0: valid_neighbor[:,:dx]=False
+            if dx<0: valid_neighbor[:,dx:]=False
+            weights=xp.exp(-((neighbor-safe)/.003)**2-xp.sum((color-other)**2,axis=2)/(30**2))*valid_neighbor
+            total+=neighbor*weights; weight+=weights
+    out=xp.where(safe>0,total/xp.maximum(weight,1e-8),0).astype(xp.float32)
+    return out.get() if xp is not np else out
+
+
 def prepare_frame(frame,settings):
     import cv2
     depth=frame.depth.copy(); h,w=depth.shape
@@ -112,12 +153,7 @@ def prepare_frame(frame,settings):
     if len(table)>1:
         reference=np.asarray(cal.get('referenceSize'),dtype=float); center=np.asarray(cal.get('distortionCenter'),dtype=float)
         if reference.shape!=(2,) or center.shape!=(2,) or not np.isfinite(table).all() or np.any(reference<=0): raise ValueError('Distorsión inválida')
-        center=center/reference*[w,h]
-        u,v=np.meshgrid(np.arange(w,dtype=np.float32),np.arange(h,dtype=np.float32))
-        radius=np.hypot(u-center[0],v-center[1])
-        max_radius=np.hypot(max(center[0],w-center[0]),max(center[1],h-center[1]))
-        magnification=np.interp(radius,np.linspace(0,max_radius,len(table)),table)
-        mx=(u+(u-center[0])*magnification).astype(np.float32); my=(v+(v-center[1])*magnification).astype(np.float32)
+        mx,my=_undistort_maps(w,h,reference,center,table)
         depth=cv2.remap(depth,mx,my,cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT)
         rgb=cv2.remap(rgb,mx,my,cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT)
     valid=np.isfinite(depth)&(depth>=settings.min_depth_m)&(depth<=settings.max_depth_m)
@@ -128,20 +164,7 @@ def prepare_frame(frame,settings):
         safe=denoise_depth(safe,rgb,settings.model_path or None,require_cuda=settings.device=='CUDA')
         safe=np.where(valid,np.clip(safe,settings.min_depth_m,settings.max_depth_m),0).astype(np.float32)
     if settings.rgb_guidance:
-        total=safe.copy(); weight=(safe>0).astype(np.float32)
-        color=rgb.astype(np.float32)
-        for dy in (-1,0,1):
-            for dx in (-1,0,1):
-                if not dx and not dy: continue
-                neighbor=np.roll(safe,(dy,dx),(0,1)); other=np.roll(color,(dy,dx),(0,1))
-                valid_neighbor=(neighbor>0)&(safe>0)
-                if dy>0: valid_neighbor[:dy]=False
-                if dy<0: valid_neighbor[dy:]=False
-                if dx>0: valid_neighbor[:,:dx]=False
-                if dx<0: valid_neighbor[:,dx:]=False
-                weights=np.exp(-((neighbor-safe)/.003)**2-np.sum((color-other)**2,axis=2)/(30**2))*valid_neighbor
-                total+=neighbor*weights;weight+=weights
-        safe=np.where(safe>0,total/np.maximum(weight,1e-8),0).astype(np.float32)
+        safe=rgb_guided_filter(safe,rgb,settings.device=='CUDA')
     median=cv2.medianBlur(safe,3)
     safe[np.abs(safe-median)>.01]=0
     return safe,np.ascontiguousarray(rgb)
@@ -283,6 +306,7 @@ class MeshViewer(ttk.Frame):
         self.use_color=tk.BooleanVar(value=False)
         ttk.Checkbutton(bar,text='Color RGB',variable=self.use_color,command=self.request).pack(side='right',padx=(6,0))
         ttk.Button(bar,text='Restablecer vista',command=self.reset).pack(side='right')
+        ttk.Button(bar,text='Rotar 90°',command=lambda:(self.camera.roll_by(1),self.request())).pack(side='right',padx=(0,6))
         self.canvas=tk.Canvas(self,bg='#141a26',highlightthickness=0,width=200,height=160); self.canvas.pack(fill='both',expand=True)
         ttk.Label(self,text='Arrastrar: girar · Clic derecho o Shift+arrastrar: desplazar · Rueda: zoom · Doble clic: restablecer',
                   foreground='#64748b').pack(fill='x')
@@ -295,7 +319,7 @@ class MeshViewer(ttk.Frame):
         c.bind('<MouseWheel>',lambda event:self.zoom(1.15 if event.delta>0 else 1/1.15))
         c.bind('<Button-4>',lambda event:self.zoom(1.15)); c.bind('<Button-5>',lambda event:self.zoom(1/1.15))
         c.bind('<Double-Button-1>',lambda event:self.reset())
-        bar.bind('<Configure>',lambda event:self.info_label.configure(wraplength=max(150,event.width-260)))
+        bar.bind('<Configure>',lambda event:self.info_label.configure(wraplength=max(150,event.width-340)))
 
     def press(self,event,mode): self.last=(event.x,event.y); self.mode=mode
 
@@ -409,7 +433,9 @@ class OfflineStudio:
                  self.reconstruct_button,self.cancel_button]
         body=ttk.Frame(root,padding=(10,6,10,0)); body.pack(fill='both',expand=True)
         body.rowconfigure(0,weight=1); body.columnconfigure(1,weight=1)
-        controls=ttk.Frame(body,width=360); controls.grid(row=0,column=0,sticky='nsew',padx=(0,10)); controls.grid_propagate(False)
+        controls=ttk.Frame(body,width=380); controls.grid(row=0,column=0,sticky='nsew',padx=(0,10))
+        # The notebook inside is packed: keep the panel width with pack_propagate.
+        controls.pack_propagate(False); controls.grid_propagate(False)
         tabs=ttk.Notebook(controls); tabs.pack(fill='both',expand=True)
         def page(title):
             panel=ttk.Frame(tabs); tabs.add(panel,text=title)
@@ -437,12 +463,12 @@ class OfflineStudio:
         # Reconstruction page: Simple / Advanced.
         self.ui_mode=tk.StringVar(value='Simple')
         modes=ttk.Frame(quality); modes.pack(fill='x',pady=(0,6))
-        ttk.Radiobutton(modes,text='Modo Simple',variable=self.ui_mode,value='Simple',command=self.show_mode).pack(side='left')
-        ttk.Radiobutton(modes,text='Modo Avanzado',variable=self.ui_mode,value='Avanzado',command=self.show_mode).pack(side='left',padx=(12,0))
+        ttk.Radiobutton(modes,text='Simple',variable=self.ui_mode,value='Simple',command=self.show_mode).pack(side='left')
+        ttk.Radiobutton(modes,text='Avanzado',variable=self.ui_mode,value='Avanzado',command=self.show_mode).pack(side='left',padx=(12,0))
         self.label(quality,'Calidad (objetos generales)',bold=True)
         self.preset_name=tk.StringVar(value='Máxima Resolución 1:1*')
         for name in PRESETS:
-            ttk.Radiobutton(quality,text=f'{name.rstrip("*")} · {PRESETS[name].resolution_mm:g} mm',variable=self.preset_name,value=name,command=self.apply_preset).pack(anchor='w',pady=3)
+            ttk.Radiobutton(quality,text=f'{name.rstrip("*")}\n{PRESETS[name].resolution_mm:g} mm de vóxel',variable=self.preset_name,value=name,command=self.apply_preset).pack(anchor='w',pady=3)
         self.label(quality,'El valor en mm es el tamaño de vóxel (muestreo) de la reconstrucción. La precisión física la limita el sensor TrueDepth y la captura; no se garantiza 0,05 mm.',muted=True)
         self.label(quality,'Procesado',bold=True)
         self.reconstruction_mode=tk.StringVar(value='RTX sola')
@@ -468,8 +494,10 @@ class OfflineStudio:
         self.device=tk.StringVar(value='CUDA')
         self.rgb_guidance=tk.BooleanVar(value=False);self.neural_alignment=tk.BooleanVar(value=False);self.neural_denoising=tk.BooleanVar(value=False)
         self.label(adv,'Limpieza y alineación',bold=True)
-        ttk.Checkbutton(adv,text='Limpieza guiada por RGB (filtro bilateral clásico, no IA)',variable=self.rgb_guidance).pack(anchor='w',pady=2)
-        ttk.Checkbutton(adv,text='Alineación LoFTR (red de correspondencias RGB, solo en RTX + IA)',variable=self.neural_alignment).pack(anchor='w',pady=2)
+        ttk.Checkbutton(adv,text='Limpieza guiada por RGB',variable=self.rgb_guidance).pack(anchor='w',pady=(2,0))
+        self.label(adv,'Filtro bilateral clásico sobre la profundidad; no es IA.',muted=True)
+        ttk.Checkbutton(adv,text='Alineación LoFTR (IA)',variable=self.neural_alignment).pack(anchor='w',pady=(2,0))
+        self.label(adv,'Correspondencias RGB para iniciar el ICP; solo se usa en RTX + IA. No limpia la profundidad.',muted=True)
         self.label(adv,'Gestor de modelos de limpieza neuronal de profundidad',bold=True)
         from model_registry import models,default
         self.model_paths=models(); selected=default()
@@ -478,7 +506,7 @@ class OfflineStudio:
         self.model_combo=ttk.Combobox(adv,textvariable=self.model_choice,values=[p.stem for p in self.model_paths],state='readonly',width=1)
         self.model_combo.pack(fill='x',pady=4); self.model_combo.bind('<<ComboboxSelected>>',lambda event:self.describe_model())
         self.model_info=tk.StringVar(value=''); self.label(adv,self.model_info,muted=True)
-        ttk.Button(adv,text='Añadir modelo compatible (.pt + .json)',command=self.add_model).pack(fill='x',pady=2)
+        ttk.Button(adv,text='Añadir modelo (.pt + .json)',command=self.add_model).pack(fill='x',pady=2)
         ttk.Button(adv,text='Establecer como predeterminado',command=self.default_model).pack(fill='x',pady=2)
         # Report page.
         self.report_text=tk.StringVar(value='Sin reconstrucción todavía.')
@@ -511,7 +539,7 @@ class OfflineStudio:
             narrow=width<1000
             self.export_stl.grid(row=1 if narrow else 0,column=0 if narrow else 3,columnspan=2 if narrow else 1,sticky='ew',padx=(0 if narrow else 6,0),pady=(4 if narrow else 0,0))
             self.export_ply.grid(row=1 if narrow else 0,column=2 if narrow else 4,columnspan=2 if narrow else 1,sticky='ew',padx=(6,0),pady=(4 if narrow else 0,0))
-            controls.configure(width=280 if width<900 else 360)
+            controls.configure(width=max(300,min(440,int(width*.30))))
             status_label.configure(wraplength=max(300,width-30))
             self.root.after_idle(self.rewrap)
         self.root.bind('<Configure>',responsive,add='+')
@@ -519,12 +547,23 @@ class OfflineStudio:
         responsive(type('Layout',(),{'widget':self.root,'width':self.root.winfo_width()})())
         self.apply_preset(); self.show_mode(); self.describe_model(); self.update_steps()
 
+    @staticmethod
+    def set_state(widget,state):
+        # Re-applying the same state every poll clears ttk's 'pressed' flag
+        # between press and release and swallows clicks (e.g. Cancel).
+        if str(widget.cget('state'))!=state: widget.configure(state=state)
+
     def label(self,parent,text,bold=False,muted=False):
         options={'wraplength':300}
         if bold: options['font']=('Segoe UI',9,'bold')
         if muted: options['foreground']='#64748b'
         item=ttk.Label(parent,textvariable=text,**options) if isinstance(text,tk.Variable) else ttk.Label(parent,text=text,**options)
-        item.pack(fill='x',pady=3); self.wrap_labels.append(item); return item
+        item.pack(fill='x',pady=3); self.wrap_labels.append(item)
+        def fit(event,item=item):
+            width=max(120,event.width-6)
+            if abs(int(str(item.cget('wraplength')) or 0)-width)>4: item.configure(wraplength=width)
+        item.bind('<Configure>',fit)
+        return item
 
     def rewrap(self):
         for item in self.wrap_labels:
@@ -684,8 +723,8 @@ class OfflineStudio:
         self.phone_message.set('\n'.join(item for item in extra if item))
         self.transfer_message.set(f"Transferencia (iPhone): {value.get('transferMessage','')} · Caché del iPhone: {value.get('pendingMB',0):.0f}/{value.get('cacheLimitMB',180):.0f} MB en {value.get('pendingSessions',0)} sesión(es). Bloques recibidos aquí: {self.blocks_received}.")
         if error: self.status.set('iPhone: '+error)
-        self.capture_button.configure(state='disabled' if self.phone_active or self.phone_busy or self.busy else 'normal')
-        self.stop_button.configure(state='normal' if self.phone_active and not self.phone_busy else 'disabled')
+        self.set_state(self.capture_button,'disabled' if self.phone_active or self.phone_busy or self.busy else 'normal')
+        self.set_state(self.stop_button,'normal' if self.phone_active and not self.phone_busy else 'disabled')
         if self.phone_active and self.busy:
             self.cancel.set(); self.status.set('Captura iniciada en el iPhone: cancelando la reconstrucción para priorizar la captura.')
 
@@ -720,6 +759,7 @@ class OfflineStudio:
                 self.status.set(text+' Pulsa Reconstruir.')
             elif kind=='progress':
                 current,total,accepted,rejected,device,fitness,rmse=value; self.progress['value']=current/max(1,total)*100
+                if self.cancel.is_set(): continue
                 self.status.set(f'{getattr(self,"variant_label","")}{device} · {current}/{total} · {accepted} aceptados · {rejected} rechazados · RMSE {rmse*1000:.2f} mm')
             elif kind=='variant': self.variant_label=f'[{value}] '
             elif kind=='comparison':
@@ -730,8 +770,8 @@ class OfflineStudio:
                 self.busy=False; self.status.set(str(value))
             elif kind=='error': self.status.set(str(value))
             else: self.status.set(str(value))
-        self.reconstruct_button.configure(state='disabled' if self.busy else 'normal')
-        self.cancel_button.configure(state='normal' if self.busy else 'disabled')
+        self.set_state(self.reconstruct_button,'disabled' if self.busy else 'normal')
+        self.set_state(self.cancel_button,'normal' if self.busy else 'disabled')
         self.update_steps()
         self.root.after(100,self.poll)
 
