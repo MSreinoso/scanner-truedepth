@@ -54,6 +54,19 @@ CORRECCIONES HECHAS CON TU CAPTURA REAL (sesión b11879c2, 691 fotogramas del 18
 - Botón "Cancelar procesado" podía ignorar el clic (se reaplicaba su estado cada 100 ms). Corregido.
 - Panel izquierdo recortaba textos y opciones. Corregido y cubierto por prueba automática.
 - Visor: botón "Rotar 90°" (el sensor graba en horizontal; elige qué lado es arriba).
+- Seguimiento con dos umbrales: uno estricto decide qué se fusiona en la malla; otro más
+  amplio mantiene el seguimiento con fotogramas ruidosos que NO se fusionan.
+- Sketch / Vista Previa usa ahora todos los fotogramas: saltando 1 de cada 3, tu captura
+  perdía el seguimiento en el fotograma 30 (10 de 230 aceptados). Sigue siendo rápido en la
+  fusión (vóxel 2 mm), pero la alineación tarda lo mismo que en los otros modos.
+- La rueda del ratón desplaza el panel lateral también sobre etiquetas y campos.
+- En tu captura los últimos 69 fotogramas (del 622 al 691) no se alinean con nada: es el
+  tramo final de la grabación (probablemente al retirar o girar el teléfono). Se descartan.
+Probado en la interfaz real con tu captura: abrir sesión, Comparar ambas, malla sólida en el
+visor (RTX), girar, zoom, Rotar 90°, Alternar con el mismo encuadre y exportar STL: el archivo
+tenía exactamente los 104.133 triángulos del resultado "RTX + IA" seleccionado, en mm.
+Pendiente: alinear cuesta ~1 s por fotograma (ICP CuPy dirigido desde Python); 691 fotogramas
+tardan ~10 min antes de la fusión. Pendiente también una relocalización con búsqueda amplia.
 Pendiente: la reconstrucción real deja fragmentos sueltos en zonas vistas pocas veces
 (hombros, fondo). Subir "Observaciones mínimas" en Avanzado los reduce; no se eliminan solos.
 

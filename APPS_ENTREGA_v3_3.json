@@ -1,0 +1,90 @@
+{
+  "version": "3.3",
+  "fecha": "2026-11-04",
+  "commits": {
+    "principal": "70069e6",
+    "captura_real_y_fusion": "a330711",
+    "seguimiento_y_panel": "e13a534"
+  },
+  "windows": {
+    "archivo": "Bichito3D-Unificado-v3.3.exe",
+    "bytes": 3396415284,
+    "sha256": "888217a8497acbe484d98ab437ec2f3d8aaa7b54fe78260d42b63ac214e091e9",
+    "acceso_directo": "Bichito3D.lnk",
+    "diagnostico_empaquetado": {
+      "ok": true,
+      "frozen": true,
+      "cuda": 1,
+      "viewer": {
+        "renderer": "RTX (CUDA)",
+        "faces": 512,
+        "lod_triangles": 32
+      },
+      "loftr_device": "cuda",
+      "ui": true
+    },
+    "validacion_005mm_empaquetado": {
+      "ok": true,
+      "checks": {
+        "both_results_independent": true,
+        "stl_matches_selected": true,
+        "viewer_solid_surface": true,
+        "all_dense_stages_cuda": true
+      },
+      "resultados": {
+        "RTX sola": {
+          "triangulos": 17034018,
+          "stl_sha256": "39975b7636cef86e01f4099e852ee2a9d09de9bf3db2f614589b796431a8864a",
+          "error_mm_frente_a_superficie_analitica": {
+            "mean": 0.2126,
+            "p95": 0.6,
+            "max": 2.9203
+          }
+        },
+        "RTX + IA": {
+          "triangulos": 15548980,
+          "stl_sha256": "e2ca5f5b1629ae244e778fe511992bb7d25b6cdf3afcffd4e6681fb5e4a23623",
+          "error_mm_frente_a_superficie_analitica": {
+            "mean": 0.1716,
+            "p95": 0.4632,
+            "max": 1.7191
+          }
+        }
+      }
+    }
+  },
+  "iphone": {
+    "archivo": "Bichito3D-iPhone-v3.3.ipa",
+    "version": "3.3",
+    "build": 7,
+    "sha256": "72d3b8630715a004aec0be151e7737ac149624ef6cf738b57e81a88aae728467",
+    "artifact_github": 13292193805,
+    "artifact_zip_sha256": "e5dc7ab480b1725686a7bbf930b371c650eaf8b7b19224212504a597942ecf34",
+    "run": 41766820749
+  },
+  "captura_real_b11879c2_0_5mm": {
+    "RTX sola": {
+      "aceptados": 622,
+      "rechazados": 69,
+      "triangulos": 21664788
+    },
+    "RTX + IA": {
+      "aceptados": 622,
+      "rechazados": 69,
+      "triangulos": 21349313
+    }
+  },
+  "pendiente_hardware_real": [
+    "captura con el iPhone del usuario (causa identificada, no comprobada en el dispositivo)",
+    "reconexión Wi-Fi real",
+    "temperatura en sesiones largas",
+    "precisión física de un objeto medido"
+  ],
+  "anteriores_conservados": [
+    "Bichito3D-Unificado-v3.1.exe",
+    "dist/Bichito3D-Unificado-v3.2.exe",
+    "Bichito3D-iPhone-v3.2.ipa",
+    "Bichito3D-iPhone-v3.1.ipa",
+    "Bichito3D-v3.1-anterior.lnk"
+  ]
+}
