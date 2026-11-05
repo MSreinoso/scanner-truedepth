@@ -275,7 +275,7 @@ def reconstruct_tiled(path,settings,progress,cancel):
     # keyframe is taken when overlap drops or the motion grows.
     from collections import deque
     key=None; last=None; recent=deque(maxlen=6)
-    accepted=[]; frame_info=[]; rejected=0; keyframes=0; fallback=0
+    accepted=[]; frame_info=[]; rejected=0; keyframes=0; fallback=0; tracked=0
     for index,frame in enumerate(records(path)):
         if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; sesión original conservada')
         if index%settings.stride: continue
@@ -293,18 +293,27 @@ def reconstruct_tiled(path,settings,progress,cancel):
             # Current keyframe first; then the previous frame and recent
             # keyframes, so a single bad frame or fast motion does not end tracking.
             references=[key]+([last] if last is not key else [])+[k for k in reversed(recent) if k is not key][:3]
-            valid=False
+            valid=False; track=None
             for attempt,reference in enumerate(references):
                 guess=seed if (attempt==0 and seed is not None) else np.linalg.inv(reference['pose'])@predicted
-                try: ok,delta,fitness,rmse=register(cloud,reference['depth'],frame.intrinsics,reference['intrinsics'],guess,settings)
-                except ValueError: ok=False
+                try: ok,delta,fit,err=register(cloud,reference['depth'],frame.intrinsics,reference['intrinsics'],guess,settings)
+                except ValueError: continue
                 if ok:
-                    valid=True; candidate=reference['pose']@delta
+                    valid=True; candidate=reference['pose']@delta; fitness,rmse=fit,err
                     if attempt==0:
                         promote=(fitness<min(.95,settings.min_fitness+.2) or np.linalg.norm(delta[:3,3])>.02 or rotation_angle(delta)>10)
                     else:
                         promote=True; fallback+=1
                     break
+                # Looser tracking test: keeps the pose chain alive without
+                # letting this frame into the fused geometry.
+                if (track is None and np.isfinite(delta).all() and fit>=.6*settings.min_fitness and err<=2*settings.max_rmse_mm/1000
+                        and np.linalg.norm(delta[:3,3])<=.1 and rotation_angle(delta)<=45):
+                    track=reference['pose']@delta; fitness,rmse=fit,err
+            if not valid and track is not None:
+                tracked+=1
+                last={'pose':track,'depth':cloud,'intrinsics':frame.intrinsics,'imu':frame.rotation,'images':(depth,rgb)}
+                recent.append(last)
         if valid:
             frame_keys=surface_tile_keys(cloud,frame.intrinsics,candidate,width)
             keys=unique_tiles(cp.concatenate((keys,frame_keys)))
@@ -403,7 +412,7 @@ def reconstruct_tiled(path,settings,progress,cancel):
     stages.append({'etapa':'Soldadura de la malla de visualización','dispositivo':'CUDA'})
     stages.append({'etapa':'Escritura de mosaicos y exportación','dispositivo':'CPU (E/S)'})
     report={'settings':__import__('dataclasses').asdict(settings),'captured':metadata,'accepted':len(accepted),'rejected':rejected,
-            'keyframes':keyframes,'keyframe_fallbacks':int(fallback),
+            'keyframes':keyframes,'keyframe_fallbacks':int(fallback),'tracking_only_frames':int(tracked),
             'device':'CUDA: ICP + localización + TSDF + Marching Cubes',
             'gpu_name':cp.cuda.runtime.getDeviceProperties(0)['name'].decode(),
             'stages':stages,'cpu_tasks':['decodificación y rectificación RGB-D','selección de vistas por mosaico (escalares)','E/S de disco'],

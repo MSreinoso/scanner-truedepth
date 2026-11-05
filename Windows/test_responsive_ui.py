@@ -33,6 +33,13 @@ class ResponsiveTests(unittest.TestCase):
                         self.assertLessEqual(child.winfo_reqwidth(),panel.winfo_width(),child.cget('text'))
                     if child.winfo_class()=='TLabel' and child.winfo_ismapped():
                         self.assertLessEqual(int(str(child.cget('wraplength')) or 0),panel.winfo_width(),child.cget('text'))
+                # Wheel over a field (not the canvas) still scrolls the panel.
+                canvas=panel.master; canvas.yview_moveto(0); root.update()
+                field=next(c for c in walk(panel) if c.winfo_class()=='TEntry' and c.winfo_ismapped())
+                before=canvas.yview()[0]
+                field.event_generate('<MouseWheel>',delta=-120,rootx=field.winfo_rootx()+3,rooty=field.winfo_rooty()+3,x=3,y=3,warp=False)
+                root.update()
+                self.assertGreater(canvas.yview()[0],before,f'{width}x{height}')
                 app.ui_mode.set('Simple'); app.show_mode()
                 self.assertEqual(app.quality.get(),.05)
                 self.assertEqual(app.device.get(),'CUDA')

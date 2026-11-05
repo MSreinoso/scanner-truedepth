@@ -64,7 +64,8 @@ class Settings:
 
 PRESETS = {
     'Escaneo Estándar': Settings(resolution_mm=.5, registration_mm=2., memory_mb=2048,rgb_guidance=True),
-    'Sketch / Vista Previa': Settings(resolution_mm=2., registration_mm=3., stride=3, min_observations=1.),
+    # Every frame: skipping frames broke tracking on real hand-held captures.
+    'Sketch / Vista Previa': Settings(resolution_mm=2., registration_mm=3., stride=1, min_observations=1.),
     'Resolución Alta': Settings(resolution_mm=.2, registration_mm=1., memory_mb=2048,rgb_guidance=True),
     'Máxima Resolución 1:1*': Settings(resolution_mm=.05, registration_mm=.5, memory_mb=2048),
 }
@@ -437,6 +438,24 @@ class OfflineStudio:
         # The notebook inside is packed: keep the panel width with pack_propagate.
         controls.pack_propagate(False); controls.grid_propagate(False)
         tabs=ttk.Notebook(controls); tabs.pack(fill='both',expand=True)
+        # One wheel handler: scrolls the panel under the pointer, also over
+        # labels and fields (child widgets do not inherit canvas bindings).
+        self.scroll_canvases=set()
+        def panel_of(widget):
+            try:
+                while widget is not None and str(widget) not in self.scroll_canvases:
+                    parent=widget.winfo_parent()
+                    widget=self.root.nametowidget(parent) if parent else None
+            except (KeyError,tk.TclError): return None
+            return widget
+        def wheel(event):
+            target=None
+            if isinstance(event.widget,tk.Misc): target=panel_of(event.widget)
+            if target is None:
+                try: target=panel_of(self.root.winfo_containing(event.x_root,event.y_root))
+                except (KeyError,tk.TclError): target=None
+            if target is not None and event.delta: target.yview_scroll(-1 if event.delta>0 else 1,'units') if abs(event.delta)<120 else target.yview_scroll(-int(event.delta/120),'units')
+        self.root.bind_all('<MouseWheel>',wheel,add='+')
         def page(title):
             panel=ttk.Frame(tabs); tabs.add(panel,text=title)
             canvas=tk.Canvas(panel,highlightthickness=0,width=200)
@@ -446,8 +465,7 @@ class OfflineStudio:
             frame=ttk.Frame(canvas,padding=10); window=canvas.create_window((0,0),window=frame,anchor='nw')
             frame.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
             canvas.bind('<Configure>',lambda event:canvas.itemconfigure(window,width=event.width))
-            def wheel(event): canvas.yview_scroll(-int(event.delta/120),'units')
-            for widget in (canvas,frame): widget.bind('<MouseWheel>',wheel)
+            self.scroll_canvases.add(str(canvas))
             return frame
         capture=page('Captura'); quality=page('Reconstrucción'); report=page('Informe')
         # Capture page: state of the phone, transfer and session.
