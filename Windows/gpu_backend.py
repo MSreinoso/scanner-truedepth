@@ -218,6 +218,10 @@ class TiledModel:
 
     def export_mm(self,path):
         path=Path(path); parts=sorted(self.folder.glob('tile-*.npz'))
+        per_triangle=50 if path.suffix.lower()=='.stl' else 3*15+13
+        need=84+per_triangle*len(self.triangles)
+        if free_bytes(path.parent)<need+256*1024**2:
+            raise DiskSpaceError(f'No hay espacio para exportar: el archivo ocupará ~{gb(need)} GB y hay {gb(free_bytes(path.parent))} GB libres en {path.parent}.')
         if path.suffix.lower()=='.stl':
             if len(self.triangles)>0xffffffff: raise ValueError('Demasiados triángulos para STL binario; usa PLY')
             with open(path,'wb') as file:
@@ -239,7 +243,8 @@ class TiledModel:
                 for part in parts:
                     with np.load(part) as data:
                         vertices=data['vertices'].reshape(-1,3)*1000; colors=data['colors'].reshape(-1,3)
-                    out=np.empty(len(vertices),dtype=dtype);out['xyz']=vertices;out['rgb']=np.clip(colors*255,0,255).astype(np.uint8);file.write(out.tobytes())
+                    rgb=colors if colors.dtype==np.uint8 else np.clip(colors*255,0,255).astype(np.uint8)
+                    out=np.empty(len(vertices),dtype=dtype);out['xyz']=vertices;out['rgb']=rgb;file.write(out.tobytes())
                 faces=np.dtype([('n','u1'),('indices','<i4',(3,))])
                 for start in range(0,len(self.triangles),100000):
                     count=min(100000,len(self.triangles)-start);out=np.empty(count,dtype=faces);out['n']=3
@@ -255,7 +260,43 @@ def rotation_angle(transform):
     return math.degrees(math.acos(float(np.clip((np.trace(transform[:3,:3])-1)/2,-1,1))))
 
 
+BYTES_PER_TRIANGLE=9*4+9      # float32 vertices + uint8 RGB per triangle in tile files
+FRAME_INPUT_BYTES=640*480*(4+3)
+DISK_MARGIN=2*1024**3
+
+
+def free_bytes(folder):
+    import shutil
+    return shutil.disk_usage(folder).free
+
+
+def estimate_mesh_bytes(surface_tiles,cells):
+    """Upper-range estimate: a surface crossing a tile yields ~2*cells^2 triangles."""
+    return int(surface_tiles*2*cells*cells*BYTES_PER_TRIANGLE*1.15)
+
+
+class DiskSpaceError(OSError):
+    pass
+
+
+def gb(value): return f'{value/1024**3:.1f}'.replace('.',',')
+
+
 def reconstruct_tiled(path,settings,progress,cancel):
+    """Creates the result folder and removes it if reconstruction does not finish:
+    an incomplete tile set cannot be viewed or exported and only fills the disk.
+    The original session is never touched."""
+    import shutil
+    folder=Path(path).parent/(Path(path).stem+'-cuda-'+__import__('uuid').uuid4().hex[:8])
+    folder.mkdir()
+    try:
+        return _reconstruct_tiled(path,settings,progress,cancel,folder)
+    except BaseException:
+        shutil.rmtree(folder,ignore_errors=True)
+        raise
+
+
+def _reconstruct_tiled(path,settings,progress,cancel,folder):
     """All dense 3D stages on the RTX. CPU: decoding, rectification, file I/O
     and per-tile frustum culling of a handful of scalars."""
     from capture_format import validate_session,records
@@ -264,8 +305,10 @@ def reconstruct_tiled(path,settings,progress,cancel):
     from mesh_view import weld,VIEW_BUDGET
     metadata=validate_session(path)
     clock=__import__('time').perf_counter; t0=clock(); timings={}
-    folder=Path(path).parent/(Path(path).stem+'-cuda-'+__import__('uuid').uuid4().hex[:8])
-    folder.mkdir(); inputs=folder/'inputs'; inputs.mkdir()
+    inputs=folder/'inputs'; inputs.mkdir()
+    needed=metadata['frames']//max(1,settings.stride)*FRAME_INPUT_BYTES+DISK_MARGIN
+    if free_bytes(folder)<needed:
+        raise DiskSpaceError(f'Espacio insuficiente para preparar la reconstrucción: hacen falta ~{gb(needed)} GB y hay {gb(free_bytes(folder))} GB libres en el disco. Libera espacio; la sesión original se conserva.')
     cp=cuda_module()
     stages=[]
     cells=settings.tile_cells; voxel=settings.resolution_mm/1000; width=cells*voxel
@@ -337,6 +380,13 @@ def reconstruct_tiled(path,settings,progress,cancel):
     if settings.neural_alignment: stages.append({'etapa':'Semilla de alineación LoFTR','dispositivo':'CUDA (PyTorch)'})
     if len(accepted)<2: raise ValueError(f'Pocos frames alineados para reconstruir ({len(accepted)} aceptados, {rejected} rechazados). Revisa distancia, movimiento y parámetros ICP.')
     if len(keys)==0: raise ValueError('No se obtuvo superficie global consistente')
+    estimate=estimate_mesh_bytes(int(len(keys)),cells)
+    available=free_bytes(folder)-DISK_MARGIN
+    if estimate>available:
+        coarser=settings.resolution_mm*math.sqrt(estimate/max(available,1))*1.1
+        raise DiskSpaceError(f'La malla a {settings.resolution_mm:g} mm se estima en ~{gb(estimate)} GB y hay {gb(available)} GB disponibles. '
+                             f'No se reduce la resolución automáticamente: libera espacio, elige ≥{coarser:.2f} mm o reduce la distancia máxima en Avanzado. '
+                             'La sesión original se conserva.')
     keys=unique_tiles(cp.concatenate([keys+cp.asarray([x,y,z]) for x in (-1,0,1) for y in (-1,0,1) for z in (-1,0,1)]))
     keys=cp.asnumpy(keys)
     total=0
@@ -363,7 +413,7 @@ def reconstruct_tiled(path,settings,progress,cancel):
     shapes=np.array([info[1] for info in frame_info]); heights,widths=shapes[:,0],shapes[:,1]
     peak=0; launches=0
     for tile_index,tile_key in enumerate(keys):
-        if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; mosaicos terminados y originales conservados')
+        if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; resultado incompleto descartado y sesión original conservada')
         origin=tile_key.astype(np.float64)*width; center=origin+width/2; radius=math.sqrt(3)*width/2+.004
         tile=CudaTile(cells,voxel,origin)
         point=inverses[:,:3,:3]@center+inverses[:,:3,3]
@@ -386,7 +436,9 @@ def reconstruct_tiled(path,settings,progress,cancel):
         minimum=max(1.,settings.min_observations)
         vertices,colors=tile.mesh(minimum)
         if len(vertices):
-            np.savez(folder/f'tile-{tile_index:08d}.npz',vertices=vertices,colors=colors)
+            if tile_index%25==0 and free_bytes(folder)<DISK_MARGIN//2:
+                raise DiskSpaceError(f'Disco casi lleno durante la fusión ({gb(free_bytes(folder))} GB libres). Resultado incompleto descartado; la sesión original se conserva.')
+            np.savez(folder/f'tile-{tile_index:08d}.npz',vertices=vertices,colors=np.clip(colors*255+.5,0,255).astype(np.uint8))
             total+=len(vertices)
         for k in list(lods):
             v,c=(vertices,colors) if k==1 else tile.mesh(minimum,k)
@@ -416,7 +468,7 @@ def reconstruct_tiled(path,settings,progress,cancel):
             'device':'CUDA: ICP + localización + TSDF + Marching Cubes',
             'gpu_name':cp.cuda.runtime.getDeviceProperties(0)['name'].decode(),
             'stages':stages,'cpu_tasks':['decodificación y rectificación RGB-D','selección de vistas por mosaico (escalares)','E/S de disco'],
-            'vram_pool_peak_mb':round(peak/1024**2,1),'timings':timings,'fusion_kernel_launches':launches,
+            'disk_estimate_gb':round(estimate/1024**3,2),'vram_pool_peak_mb':round(peak/1024**2,1),'timings':timings,'fusion_kernel_launches':launches,
             'registration':'CUDA projective point-to-plane coarse-to-fine, alineación a keyframe',
             'resolution_note':'resolution_mm es el tamaño de vóxel de la reconstrucción, no la precisión física del sensor TrueDepth.',
             'vertices':total*3,'triangles':total,'tiles':len(keys),'view_levels':saved,'folder':str(folder)}

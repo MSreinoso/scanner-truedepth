@@ -43,6 +43,22 @@ class CudaTests(unittest.TestCase):
         for name in ('field','weights','colors'):
             np.testing.assert_allclose(getattr(a,name).get(),getattr(b,name).get(),rtol=0,atol=2e-6)
 
+    def test_disk_estimate_stops_and_removes_partial_result(self):
+        import gpu_backend
+        from unittest import mock
+        from offline_pipeline import Settings,reconstruct
+        from test_offline_pipeline import session
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'s.b3draw'; path.write_bytes(session(4))
+            calls=[]
+            def free(_):
+                calls.append(1); return 10**13 if len(calls)==1 else 3*1024**3
+            with mock.patch.object(gpu_backend,'free_bytes',free),mock.patch.object(gpu_backend,'estimate_mesh_bytes',lambda *a:10**11):
+                with self.assertRaises(gpu_backend.DiskSpaceError) as caught:
+                    reconstruct(path,Settings(resolution_mm=1.,device='CUDA',min_observations=1.),lambda *a:None,None)
+            self.assertIn('No se reduce la resolución',str(caught.exception))
+            self.assertEqual([p.name for p in Path(folder).iterdir()],['s.b3draw'])
+
     def test_rgb_guided_filter_matches_cpu(self):
         from offline_pipeline import rgb_guided_filter
         rng=np.random.default_rng(3)

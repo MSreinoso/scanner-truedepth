@@ -181,6 +181,8 @@ def run(destination,resolution_mm=.2):
                 'viewer':{'renderer':renderer.name,'triangles_drawn':int(len(view.faces)),'source':view.source,'screen_coverage':round(covered,3)},
                 'error_mm':{'mean':round(float(errors.mean()),4),'p95':round(float(np.percentile(errors,95)),4),'max':round(float(errors.max()),4)},
                 'seconds':round(wall,1),'stage_seconds':model_report.get('timings'),
+                'disk_estimate_gb':model_report.get('disk_estimate_gb'),
+                'tile_files_gb':round(sum(p.stat().st_size for p in Path(model_report['folder']).glob('tile-*.npz'))/1024**3,3),
                 'gpu_util_note':'nvidia-smi cada 0,5 s; mosaicos pequeños limitan la ocupación, no indican CPU',
                 'gpu_util_peak_pct':max(busy) if busy else None,'gpu_util_mean_pct':round(float(np.mean(busy)),1) if busy else None,
                 'gpu_mem_peak_mb':max((m for *_,m in samples),default=None),'vram_pool_peak_mb':model_report.get('vram_pool_peak_mb'),
