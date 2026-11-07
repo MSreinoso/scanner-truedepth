@@ -75,7 +75,6 @@
     }
   },
   "pendiente_hardware_real": [
-    "captura con el iPhone del usuario (causa identificada, no comprobada en el dispositivo)",
     "reconexión Wi-Fi real",
     "temperatura en sesiones largas",
     "precisión física de un objeto medido"
@@ -86,5 +85,20 @@
     "Bichito3D-iPhone-v3.2.ipa",
     "Bichito3D-iPhone-v3.1.ipa",
     "Bichito3D-v3.1-anterior.lnk"
-  ]
+  ],
+  "windows_3_3_1": {
+    "archivo": "Bichito3D-Unificado-v3.3.1.exe",
+    "bytes": 3396417204,
+    "sha256": "8088bf85dba1c49bd37b0c23104447fa28f88a1e70c64876f00a0406cf2944f0",
+    "commit": "f1f2782",
+    "acceso_directo": "Bichito3D.lnk",
+    "cambio": "Estimación de disco antes de fusionar, descarte de resultados incompletos, color uint8 (~40 % menos disco).",
+    "validacion": "Diagnóstico congelado OK; 0,05 mm: 17.034.018 / 15.548.980 triángulos, STL idénticos a 3.3; estimado 0,74 GB vs real 0,715 GB."
+  },
+  "captura_real_iphone_2026_11_07": {
+    "sesion": "53c34139-01ea-406e-a5be-80a6be1bbd36",
+    "fotogramas": 796,
+    "omitidos": 17,
+    "resultado": "Captura y transferencia confirmadas en el iPhone del usuario; caché liberada. La reconstrucción a 0,05 mm llenó el disco (corregido en 3.3.1)."
+  }
 }

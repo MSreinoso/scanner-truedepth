@@ -1,6 +1,9 @@
 Bichito 3D — versión 3.3 (entrega nueva)
 
 ARCHIVOS NUEVOS
+- 07/11: Bichito3D-Unificado-v3.3.1.exe (el acceso directo apunta aquí). Antes de fusionar estima
+  el espacio en disco y avisa si no cabe; descarta resultados incompletos. La v3.3.exe queda de respaldo.
+- Tu iPhone ya capturó y transfirió correctamente (796 fotogramas, 07/11).
 - Bichito3D-Unificado-v3.3.exe : app de Windows única (CUDA, IA, modelos y dependencias incluidas).
 - Bichito3D.lnk                 : acceso directo, ahora apunta a la 3.3.
 - Bichito3D-iPhone-v3.3.ipa     : app del iPhone, versión 3.3 build 7 (instalar con Sideloadly).
