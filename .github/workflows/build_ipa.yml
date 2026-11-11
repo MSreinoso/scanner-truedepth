@@ -35,7 +35,7 @@ jobs:
           path: Windows/dist/Bichito3D-Unificado-v3.3.2.exe
           compression-level: 0
   build-ipa:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Descargar código del repositorio
         uses: actions/checkout@v4
