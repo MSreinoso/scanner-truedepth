@@ -38,6 +38,8 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
     @Published var legacyMB = 0.0
     @Published var sensorFormat = ""
     @Published var sensorDiagnostics = ""
+    /// Live distance guidance (5 Hz) for the preview, the PC and the user.
+    @Published var rangeGuide: RangeGuide?
 
     let captureSession = AVCaptureSession()
     let streamClient = BinaryStreamClient()
@@ -452,6 +454,9 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
         // Five small JPEGs per second, independent of raw capture storage.
         if timestamp - lastPreview >= 0.2 {
             lastPreview = timestamp
+            if let guide = Self.measureRange(d.depthData) {
+                DispatchQueue.main.async { [weak self] in self?.rangeGuide = guide }
+            }
             let image = CIImage(cvPixelBuffer: pixel).oriented(.right)
             let small = image.transformed(by: CGAffineTransform(scaleX: 0.5, y: 0.5))
             if let cg = ciContext.createCGImage(small, from: small.extent) {
@@ -459,6 +464,18 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                 lock.lock(); jpeg = data; lock.unlock()
             }
         }
+    }
+
+    static func measureRange(_ data: AVDepthData) -> RangeGuide? {
+        let depth = data.depthDataType == kCVPixelFormatType_DepthFloat32 ? data : data.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+        let map = depth.depthDataMap
+        CVPixelBufferLockBaseAddress(map, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(map) else { return nil }
+        let width = CVPixelBufferGetWidth(map), height = CVPixelBufferGetHeight(map)
+        let stride = CVPixelBufferGetBytesPerRow(map) / MemoryLayout<Float>.size
+        let pointer = base.assumingMemoryBound(to: Float.self)
+        return RangeGuide.evaluate(depth: UnsafeBufferPointer(start: pointer, count: stride * height), width: width, height: height, rowStride: stride)
     }
 
     private func record(depth: AVDepthData, pixel: CVPixelBuffer, timestamp: Double) {
@@ -529,6 +546,8 @@ final class DepthCaptureManager: NSObject, ObservableObject, AVCaptureDataOutput
                 "transfer": transferKind, "transferMessage": transferMessage,
                 "pendingMB": pendingMB, "pendingSessions": pendingSessions, "rejectedSessions": rejectedSessions,
                 "legacyMB": legacyMB, "cacheLimitMB": Double(CaptureRecorder.cacheLimit) / 1_000_000,
-                "windowsIP": streamClient.serverIP, "windowsConnected": streamClient.isConnected]
+                "windowsIP": streamClient.serverIP, "windowsConnected": streamClient.isConnected,
+                "rangeLevel": rangeGuide?.level.rawValue ?? "", "rangeCm": rangeGuide?.medianCm ?? 0,
+                "rangeValidPct": rangeGuide?.validPercent ?? 0, "rangeMessage": rangeGuide?.message ?? ""]
     }
 }

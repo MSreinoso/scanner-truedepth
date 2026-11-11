@@ -59,6 +59,18 @@ class CudaTests(unittest.TestCase):
             self.assertIn('No se reduce la resolución',str(caught.exception))
             self.assertEqual([p.name for p in Path(folder).iterdir()],['s.b3draw'])
 
+    def test_tracking_volume_raycast_returns_fused_plane(self):
+        from cuda_tracking import TrackingVolume
+        depth=np.full((120,160),.40,np.float32); K=[150.,150.,80.,60.]
+        volume=TrackingVolume(depth,voxel=.004,side_m=.8)
+        for _ in range(3): volume.integrate(depth,K,np.eye(4))
+        model=volume.raycast(np.eye(4),K,depth.shape,.1,.9).get()
+        center=model[30:90,40:120]
+        self.assertGreater((center>0).mean(),.95)
+        np.testing.assert_allclose(center[center>0],.40,atol=.0015)
+        moved=np.eye(4); moved[2,3]=.05   # camera 5 cm closer: plane at 0.35 m
+        np.testing.assert_allclose(np.median(volume.raycast(moved,K,depth.shape,.1,.9).get()[40:80,60:100]),.35,atol=.0015)
+
     def test_rgb_guided_filter_matches_cpu(self):
         from offline_pipeline import rgb_guided_filter
         rng=np.random.default_rng(3)

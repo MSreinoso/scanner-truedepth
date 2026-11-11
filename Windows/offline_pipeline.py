@@ -168,6 +168,16 @@ def prepare_frame(frame,settings):
         safe=rgb_guided_filter(safe,rgb,settings.device=='CUDA')
     median=cv2.medianBlur(safe,3)
     safe[np.abs(safe-median)>.01]=0
+    # Flying pixels: at object edges TrueDepth mixes foreground and background
+    # depths. A jump to any neighbour above 2 % of the distance (8 mm at 0.4 m,
+    # i.e. surfaces seen at more than ~80 degrees) is not trusted for fusion;
+    # these pixels produced floating fragments around real scans.
+    if safe.any():
+        kernel=np.ones((3,3),np.uint8)
+        filled=np.where(safe>0,safe,np.float32(np.inf))
+        low=cv2.erode(filled,kernel); high=cv2.dilate(safe,kernel)
+        jump=np.maximum(high-safe,np.where(np.isfinite(low),safe-low,0))
+        safe[(safe>0)&(jump>.02*safe)]=0
     return safe,np.ascontiguousarray(rgb)
 
 
@@ -377,7 +387,7 @@ STEPS=['1 Conectar','2 Capturar','3 Verificar transferencia','4 Reconstruir / co
 
 class OfflineStudio:
     def __init__(self,root):
-        self.root=root; root.title('Bichito 3D 3.3 · Escaneo de objetos · RTX'); root.geometry('1380x900')
+        self.root=root; root.title('Bichito 3D 3.3.2 · Escaneo de objetos · RTX'); root.geometry('1380x900')
         self.events=queue.Queue(maxsize=200); self.cancel=threading.Event()
         self.busy,self.mesh,self.session=False,None,None
         self.results={}
@@ -475,6 +485,9 @@ class OfflineStudio:
         self.transfer_message=tk.StringVar(value='Transferencia: sin bloques recibidos todavía.')
         self.session_message=tk.StringVar(value='Sesión: ninguna verificada.')
         self.phone_phase_label=self.label(capture,self.phone_phase,bold=True)
+        # Live distance indicator from the iPhone (centre of the depth map).
+        self.range_message=tk.StringVar(value='')
+        self.range_label=self.label(capture,self.range_message,bold=True)
         self.label(capture,self.phone_message)
         self.label(capture,self.transfer_message)
         self.label(capture,self.session_message,bold=True)
@@ -671,7 +684,15 @@ class OfflineStudio:
         lines=[f'Resultado: {name}',f"GPU: {report.get('gpu_name','—')} · {report.get('device','')}",
                f"Fotogramas: {report.get('accepted',0)} aceptados, {report.get('rejected',0)} rechazados, {report.get('keyframes','—')} keyframes",
                f"Triángulos exportables: {report.get('triangles',0):,} · mosaicos: {report.get('tiles','—')} · pico de memoria CUDA: {report.get('vram_pool_peak_mb','—')} MB",
-               f"Vóxel: {report.get('settings',{}).get('resolution_mm','?')} mm (muestreo, no precisión física)",'Etapas y dispositivo:']
+               f"Vóxel: {report.get('settings',{}).get('resolution_mm','?')} mm (muestreo, no precisión física)"]
+        coherence=report.get('coherencia')
+        if coherence:
+            lines.append(f"Coherencia del escaneo: {coherence.get('final_%','—')} % de la profundidad coincide con el modelo (±4 mm), "
+                         f"desviación mediana {coherence.get('mediana_final_mm','—')} mm · refinamiento global: {coherence.get('pasadas_aceptadas',0)} pasada(s) · "
+                         f"{coherence.get('descartados_incoherentes',0)} fotograma(s) incoherentes excluidos de la fusión")
+            if coherence.get('final_%',100)<70:
+                lines.append('  Aviso: coherencia baja. Puede haber movimiento en la escena (persona, objeto) o seguimiento perdido; mantén el objeto quieto y mueve solo el iPhone.')
+        lines.append('Etapas y dispositivo:')
         lines+=[f"  • {stage['etapa']}: {stage['dispositivo']}" for stage in report.get('stages',[])]
         if report.get('folder'): lines.append(f"Carpeta: {report['folder']}")
         self.report_text.set('\n'.join(lines))
@@ -739,6 +760,9 @@ class OfflineStudio:
         if value.get('stopReason'): extra.append('Última parada: '+value['stopReason'])
         if value.get('sensor'): extra.append(value['sensor'])
         self.phone_message.set('\n'.join(item for item in extra if item))
+        level=value.get('rangeLevel','')
+        self.range_message.set(('Distancia: '+value.get('rangeMessage','')) if level else '')
+        self.range_label.configure(foreground={'ok':'#16a34a','near':'#d97706','far':'#d97706','noDepth':'#dc2626'}.get(level,''))
         self.transfer_message.set(f"Transferencia (iPhone): {value.get('transferMessage','')} · Caché del iPhone: {value.get('pendingMB',0):.0f}/{value.get('cacheLimitMB',180):.0f} MB en {value.get('pendingSessions',0)} sesión(es). Bloques recibidos aquí: {self.blocks_received}.")
         if error: self.status.set('iPhone: '+error)
         self.set_state(self.capture_button,'disabled' if self.phone_active or self.phone_busy or self.busy else 'normal')

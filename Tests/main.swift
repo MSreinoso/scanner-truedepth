@@ -16,6 +16,19 @@ let (archive, digest) = try CaptureRecorder.compress(source)
 try digest.write(to: archive.appendingPathExtension("sha256"), atomically: true, encoding: .utf8)
 print("Streaming compression fixture complete: \(archive.lastPathComponent)")
 
+// Live distance guidance (centre of the depth map).
+func guide(_ fill: (Int, Int) -> Float) -> RangeGuide {
+    var map = [Float](repeating: 0, count: 64 * 48)
+    for y in 0..<48 { for x in 0..<64 { map[y * 64 + x] = fill(x, y) } }
+    return map.withUnsafeBufferPointer { RangeGuide.evaluate(depth: $0, width: 64, height: 48) }
+}
+precondition(guide { _, _ in 0.30 }.level == .ok)
+precondition(guide { _, _ in 0.10 }.level == .near)
+precondition(guide { _, _ in 0.80 }.level == .far)
+// Object too close: the sensor returns no depth in the centre, only background around it.
+precondition(guide { x, y in (x > 15 && x < 50 && y > 10 && y < 38) ? .nan : 0.45 }.level == .noDepth)
+print("RangeGuide OK")
+
 func append<T>(_ value: T, to packet: inout Data) { var v = value; withUnsafeBytes(of: &v) { packet.append(contentsOf: $0) } }
 func frame(_ id: UInt32) -> Data {
     var packet = Data()

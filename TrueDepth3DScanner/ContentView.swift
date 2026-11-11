@@ -38,6 +38,12 @@ struct ContentView: View {
                                 .font(.caption.bold()).padding(8)
                                 .background(.ultraThinMaterial).foregroundColor(capture.isScanning ? .red : .primary)
                         }
+                    if let guide = capture.rangeGuide {
+                        Text(guide.message)
+                            .font(.callout.bold()).padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(guideColor(guide.level).opacity(0.18)))
+                            .foregroundColor(guideColor(guide.level))
+                    }
                     Text("\(capture.capturedFrames) fotogramas • \(capture.recordedMB, specifier: "%.0f") MB sesión • \(capture.droppedFrames) omitidos")
                         .font(.caption.monospaced())
                     Text(capture.statusMessage).font(.callout)
@@ -90,6 +96,10 @@ struct ContentView: View {
             }
         }
         .navigationViewStyle(.stack)
+    }
+
+    private func guideColor(_ level: RangeGuide.Level) -> Color {
+        switch level { case .ok: return .green; case .near, .far: return .orange; case .noDepth: return .red }
     }
 
     private var connectionCard: some View {

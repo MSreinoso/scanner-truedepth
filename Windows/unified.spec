@@ -5,7 +5,7 @@ CArchiveWriter._COMPRESSION_LEVEL=6
 from pathlib import Path
 root=Path(SPECPATH)
 datas=[(str(root/'models'),'models'),(str(root/'.models'),'.models')]
-binaries=[];hidden=['mesh_view','capture_format','validation_v33','chunk_protocol','gpu_backend','cuda_registration',
+binaries=[];hidden=['mesh_view','capture_format','validation_v33','chunk_protocol','gpu_backend','cuda_registration','cuda_tracking',
         'neural_depth','ai_alignment','model_registry','bundle_checks','offline_pipeline']
 for distribution in ('nvidia-cuda-runtime-cu12','nvidia-cuda-nvrtc-cu12'):
     datas+=copy_metadata(distribution)
@@ -37,5 +37,5 @@ for module,source,kind in a.pure:
     if source not in ('-',None) and Path(source).resolve().parent==root.resolve():
         project_cache[module]=get_code_object(module,source,optimize=0)
 pyz=PYZ(a.pure)
-exe=EXE(pyz,a.scripts,a.binaries,a.datas,[],name='Bichito3D-Unificado-v3.3',debug=False,
+exe=EXE(pyz,a.scripts,a.binaries,a.datas,[],name='Bichito3D-Unificado-v3.3.2',debug=False,
         strip=False,upx=False,console=False)

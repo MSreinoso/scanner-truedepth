@@ -1,3 +1,48 @@
+Bichito 3D — 3.3.2 (Windows) y 3.3.1 build 8 (iPhone) · 11/11/2026
+
+QUÉ CAMBIA (respuesta a "la reconstrucción aparece movida")
+- Seguimiento como un escáner profesional: cada fotograma se alinea contra el MODELO formado por
+  todo lo escaneado hasta ese momento (TSDF de 5 mm + ray casting en la RTX), no contra el
+  fotograma anterior. Después se afina con los datos originales del keyframe.
+- La rotación del giroscopio del iPhone NO coincidía con la cámara TrueDepth (hasta 7-8 cm de error
+  al usarla como punto de partida). Ahora la predicción usa velocidad constante, luego "sin
+  movimiento" y el giroscopio solo como último recurso. Si se pierde, intenta relocalizarse
+  desde vistas anteriores.
+- El límite de error crece con la distancia (el ruido de TrueDepth crece con la distancia):
+  fotogramas buenos a 40 cm ya no se descartan por 3,0-3,1 mm.
+- Refinamiento global: al terminar, cada fotograma se vuelve a alinear contra el modelo completo;
+  se adopta solo si el escaneo queda más coherente. Los fotogramas que no coinciden con el modelo
+  (seguimiento perdido, una mano/persona que se mueve, el objeto movido) no se fusionan.
+- Nuevo dato en el Informe: "Coherencia del escaneo" (% de profundidad que coincide con el modelo
+  ±4 mm). Si es baja, la app avisa de movimiento en la escena.
+- Banda TSDF adaptada al ruido medido de cada fotograma (2-12 mm): mucho menos "polvo" suelto.
+- Se descartan píxeles de borde mezclados (flying pixels) antes de fusionar.
+- ICP en un solo kernel CUDA: 20-25 ms por alineación (antes 400-700 ms). Tu captura de 796
+  fotogramas: alineación ~2 min (antes ~46 min). Resultado determinista: misma entrada = mismo STL.
+- iPhone 3.3.1: indicador de distancia en vivo (también en Windows, pestaña Captura):
+  verde = 20-55 cm correcto; naranja = demasiado cerca/lejos; rojo = sin profundidad en el centro.
+
+LO QUE SE VIO EN TU CAPTURA DEL 07/11 (53c34139, 796 fotogramas)
+- La botella VIVE100 estaba casi siempre demasiado cerca del iPhone: en el mapa de profundidad
+  aparece NEGRA (sin medida). TrueDepth no mide por debajo de ~15-20 cm. Lo que se reconstruyó
+  fue sobre todo el escritorio y la habitación del fondo.
+- La botella se movía junto con el teléfono (sostenida en la mano) y aparecen tu mano/ropa: eso no
+  es una escena rígida y ningún seguimiento puede fijarla en el espacio.
+- Con la 3.3.2: 796/796 fotogramas alineados (antes 393/403), coherencia 60 → 64 %, 35 fotogramas
+  incoherentes excluidos. El escritorio y el teclado salen coherentes; la botella solo en parte.
+
+CÓMO ESCANEAR PARA QUE QUEDE FIJO
+1 Pon el objeto quieto sobre una mesa (no en la mano). 2 Mantén el iPhone a 20-40 cm (indicador verde).
+3 Mueve SOLO el teléfono alrededor del objeto, despacio. 4 Que no entren manos ni personas en la imagen.
+5 Objetos brillantes o transparentes devuelven poca profundidad: el indicador lo muestra en rojo.
+
+PENDIENTE / NO VERIFICADO
+- El indicador de distancia del iPhone se compila y se prueba en CI (macOS), pero aún no en tu iPhone.
+- No hay cierre de lazo (loop closure) global: en vueltas muy largas puede quedar deriva pequeña.
+- El seguimiento con objeto en la mano (o plato giratorio) no está soportado: el fondo manda.
+
+------------------------------------------------------------------------------------------
+
 Bichito 3D — versión 3.3 (entrega nueva)
 
 ARCHIVOS NUEVOS

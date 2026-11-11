@@ -63,8 +63,9 @@ extern "C" __global__ void integrate(float* field, float* weights, float* colors
 INTEGRATE_MANY=r'''
 extern "C" __global__ void integrate_many(float* field, float* weights, float* colors,
  const unsigned long long* depth_ptrs, const unsigned long long* rgb_ptrs, const float* E, const float* K,
- const int* sizes, int count, int side, float ox, float oy, float oz, float voxel, float truncation) {
+ const int* sizes, int count, int side, float ox, float oy, float oz, float voxel, const float* truncs) {
  // Same arithmetic and frame order as `integrate`, one launch for all visible frames.
+ // Each frame carries its own TSDF band (measured noise of that frame).
  int i=blockDim.x*blockIdx.x+threadIdx.x, total=side*side*side;
  if(i>=total) return;
  int x=i%side,y=(i/side)%side,z=i/(side*side);
@@ -76,7 +77,7 @@ extern "C" __global__ void integrate_many(float* field, float* weights, float* c
   float py=e[4]*wx+e[5]*wy+e[6]*wz+e[7];
   float pz=e[8]*wx+e[9]*wy+e[10]*wz+e[11];
   if(pz<=0) continue;
-  int width=sizes[2*k],height=sizes[2*k+1];
+  int width=sizes[2*k],height=sizes[2*k+1]; float truncation=truncs[k];
   int u=__float2int_rn(q[0]*px/pz+q[2]),v=__float2int_rn(q[1]*py/pz+q[3]);
   if(u<0||v<0||u>=width||v>=height) continue;
   int pixel=v*width+u;
@@ -131,6 +132,16 @@ def _kernel(code,name):
     return _KERNELS[(code,name)]
 
 
+def truncation(voxel,noise=0.):
+    """TSDF band: at least 8 voxels / 2 mm, widened to ~3 sigma of the frame's
+    measured depth noise. `noise` is the point-to-plane ICP RMSE of the frame
+    (two noisy surfaces, so sigma ~ rmse/sqrt2 and 3 sigma ~ 2.1 rmse). Real
+    TrueDepth frames at 0.3-0.6 m measure 1.5-3 mm: a fixed narrow band let
+    single noisy samples create floating fragments instead of averaging, while
+    a fixed wide band rounded sharp edges of clean data. Capped at 12 mm."""
+    return float(min(.012,max(voxel*8,.002,2.1*noise)))
+
+
 class CudaTile:
     def __init__(self,cells,voxel,origin):
         self.cp=cp=cuda_module(); self.cells=cells; self.voxel=voxel; self.origin=origin
@@ -149,15 +160,16 @@ class CudaTile:
         E=cp.asarray(np.stack([f[2] for f in frames]).astype(np.float32))
         K=cp.asarray(np.array([f[3] for f in frames],dtype=np.float32))
         sizes=cp.asarray(np.array([(f[4],f[5]) for f in frames],dtype=np.int32))
+        truncs=cp.asarray(np.array([f[6] if len(f)>6 else truncation(self.voxel) for f in frames],dtype=np.float32))
         kernel(((self.side**3+255)//256,),(256,),(self.field,self.weights,self.colors,depth_ptrs,rgb_ptrs,E,K,sizes,np.int32(len(frames)),
-            np.int32(self.side),*[np.float32(v) for v in self.origin],np.float32(self.voxel),np.float32(max(self.voxel*8,.002))))
+            np.int32(self.side),*[np.float32(v) for v in self.origin],np.float32(self.voxel),truncs))
 
     def integrate(self,depth,rgb,intrinsics,pose):
         cp=self.cp; h,w=depth.shape
         E=cp.asarray(np.linalg.inv(pose).astype(np.float32)); K=cp.asarray(intrinsics,dtype=cp.float32)
         self.kernel(((self.side**3+255)//256,),(256,),
           (self.field,self.weights,self.colors,cp.asarray(depth,dtype=cp.float32),cp.asarray(rgb,dtype=cp.uint8),E,K,
-           np.int32(w),np.int32(h),np.int32(self.side),*[np.float32(v) for v in self.origin],np.float32(self.voxel),np.float32(max(self.voxel*8,.002))))
+           np.int32(w),np.int32(h),np.int32(self.side),*[np.float32(v) for v in self.origin],np.float32(self.voxel),np.float32(truncation(self.voxel))))
 
     def mesh(self,min_weight=1.,stride=1):
         """Marching Cubes in CUDA. stride>1 samples the same TSDF every `stride`
@@ -318,7 +330,10 @@ def _reconstruct_tiled(path,settings,progress,cancel,folder):
     # keyframe is taken when overlap drops or the motion grows.
     from collections import deque
     key=None; last=None; recent=deque(maxlen=6)
-    accepted=[]; frame_info=[]; rejected=0; keyframes=0; fallback=0; tracked=0
+    accepted=[]; frame_info=[]; noise=[]; rejected=0; keyframes=0; fallback=0; tracked=0; model_tracked=0; refined_frames=0
+    velocity=np.eye(4); previous_ok=False; lost=False; miss=0; relocalized=0; keyring=[]
+    from cuda_tracking import TrackingVolume
+    volume=None
     for index,frame in enumerate(records(path)):
         if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; sesión original conservada')
         if index%settings.stride: continue
@@ -328,52 +343,158 @@ def _reconstruct_tiled(path,settings,progress,cancel,folder):
         candidate=np.eye(4); promote=key is None
         if valid and key is not None:
             imu=np.eye(4); imu[:3,:3]=relative_rotation(last['imu'],frame.rotation)
-            predicted=last['pose']@imu      # constant position + IMU rotation
+            # Motion prediction. Real captures showed the IMU-derived rotation is
+            # not reliably expressed in the TrueDepth camera frame (it diverged
+            # from ICP by several degrees), so it is only one of several seeds:
+            # constant velocity first, then "no motion", then IMU.
+            seeds=[last['pose']@velocity,last['pose'],last['pose']@imu]
+            if lost:
+                # Relocalization: the phone may return to an earlier viewpoint.
+                seeds+=[k['pose'] for k in reversed(keyring[-12:])]
+            predicted=seeds[0]
             seed=None
             if settings.neural_alignment:
                 from ai_alignment import neural_seed
                 seed=neural_seed((depth,rgb),key['images'],frame.intrinsics,key['intrinsics'],require_cuda=True)
-            # Current keyframe first; then the previous frame and recent
-            # keyframes, so a single bad frame or fast motion does not end tracking.
             references=[key]+([last] if last is not key else [])+[k for k in reversed(recent) if k is not key][:3]
             valid=False; track=None
+            # Frame-to-model first: align against the depth ray-cast from
+            # everything fused so far, seen from each candidate pose.
+            if volume is not None and seed is None:
+                best=None; need=max(settings.min_fitness,.7) if lost else settings.min_fitness
+                for guess in seeds:
+                    model=volume.raycast(guess,frame.intrinsics,depth.shape,settings.min_depth_m*.8,settings.max_depth_m*1.1)
+                    if int(cp.count_nonzero(model))<.15*int(cp.count_nonzero(cloud)): continue
+                    try: ok,delta,fit,err=register(cloud,model,frame.intrinsics,frame.intrinsics,np.eye(4),settings)
+                    except ValueError: continue
+                    # First seed that converges wins (seeds are ordered by
+                    # likelihood); each extra ICP costs a full coarse-to-fine pass.
+                    if ok and fit>=need:
+                        best=(guess@delta,fit,err); break
+                if best is not None:
+                    valid=True; candidate,fitness,rmse=best; model_tracked+=1
+                    if lost: relocalized+=1
+                    # Robust pose from the coarse model; fine accuracy from the raw
+                    # keyframe data, accepted only if it agrees with the model.
+                    try:
+                        fine_ok,fine,ffit,ferr=register(cloud,key['depth'],frame.intrinsics,key['intrinsics'],np.linalg.inv(key['pose'])@candidate,settings)
+                        refined=key['pose']@fine; change=np.linalg.inv(candidate)@refined
+                        if fine_ok and np.linalg.norm(change[:3,3])<=.005 and rotation_angle(change)<=2:
+                            candidate=refined; fitness,rmse=ffit,ferr; refined_frames+=1
+                    except ValueError: pass
+                    relative=np.linalg.inv(key['pose'])@candidate
+                    promote=np.linalg.norm(relative[:3,3])>.02 or rotation_angle(relative)>10
+                    references=[]
             for attempt,reference in enumerate(references):
-                guess=seed if (attempt==0 and seed is not None) else np.linalg.inv(reference['pose'])@predicted
-                try: ok,delta,fit,err=register(cloud,reference['depth'],frame.intrinsics,reference['intrinsics'],guess,settings)
-                except ValueError: continue
-                if ok:
-                    valid=True; candidate=reference['pose']@delta; fitness,rmse=fit,err
-                    if attempt==0:
-                        promote=(fitness<min(.95,settings.min_fitness+.2) or np.linalg.norm(delta[:3,3])>.02 or rotation_angle(delta)>10)
-                    else:
-                        promote=True; fallback+=1
-                    break
-                # Looser tracking test: keeps the pose chain alive without
-                # letting this frame into the fused geometry.
-                if (track is None and np.isfinite(delta).all() and fit>=.6*settings.min_fitness and err<=2*settings.max_rmse_mm/1000
-                        and np.linalg.norm(delta[:3,3])<=.1 and rotation_angle(delta)<=45):
-                    track=reference['pose']@delta; fitness,rmse=fit,err
+                guesses=[seed] if (attempt==0 and seed is not None) else [np.linalg.inv(reference['pose'])@g for g in seeds[:3]]
+                for guess in guesses:
+                    try: ok,delta,fit,err=register(cloud,reference['depth'],frame.intrinsics,reference['intrinsics'],guess,settings)
+                    except ValueError: continue
+                    if ok: break
+                    # Looser tracking test: keeps the pose chain alive without
+                    # letting this frame into the fused geometry.
+                    if (track is None and np.isfinite(delta).all() and fit>=.6*settings.min_fitness and err<=2*settings.max_rmse_mm/1000
+                            and np.linalg.norm(delta[:3,3])<=.1 and rotation_angle(delta)<=45):
+                        track=reference['pose']@delta; fitness,rmse=fit,err
+                else: continue
+                valid=True; candidate=reference['pose']@delta; fitness,rmse=fit,err
+                if attempt==0:
+                    promote=(fitness<min(.95,settings.min_fitness+.2) or np.linalg.norm(delta[:3,3])>.02 or rotation_angle(delta)>10)
+                else:
+                    promote=True; fallback+=1
+                break
             if not valid and track is not None:
                 tracked+=1
+                velocity=np.linalg.inv(last['pose'])@track
                 last={'pose':track,'depth':cloud,'intrinsics':frame.intrinsics,'imu':frame.rotation,'images':(depth,rgb)}
-                recent.append(last)
+                recent.append(last); lost=False
         if valid:
             frame_keys=surface_tile_keys(cloud,frame.intrinsics,candidate,width)
             keys=unique_tiles(cp.concatenate((keys,frame_keys)))
             current={'pose':candidate,'depth':cloud,'intrinsics':frame.intrinsics,'imu':frame.rotation,'images':(depth,rgb)}
-            last=current
+            # Constant-velocity model only across consecutive frames.
+            velocity=np.linalg.inv(last['pose'])@candidate if (last is not None and previous_ok) else np.eye(4)
+            if np.linalg.norm(velocity[:3,3])>.05 or rotation_angle(velocity)>15: velocity=np.eye(4)
+            last=current; lost=False; previous_ok=True
+            if volume is None: volume=TrackingVolume(depth)
+            volume.integrate(cloud,frame.intrinsics,candidate)
             if promote:
                 key=current; keyframes+=1; recent.append(current)
+                keyring.append({'pose':candidate})
             name=f'{index:09d}'
             np.save(inputs/(name+'-depth.npy'),depth);np.save(inputs/(name+'-rgb.npy'),rgb)
             accepted.append((name,candidate.copy(),frame.intrinsics.copy(),np.linalg.inv(candidate)))
+            noise.append(float(rmse) if (len(accepted)>1 and np.isfinite(rmse)) else np.nan)
             positive=depth[depth>0]
             frame_info.append(((float(positive.min()),float(positive.max())) if positive.size else (np.inf,-np.inf),depth.shape,depth.nbytes+rgb.nbytes))
-        else: rejected+=1
+        else:
+            rejected+=1; previous_ok=False
+            if key is not None:
+                miss+=1; lost=miss>=3
+        if valid: miss=0
         progress(index+1,metadata['frames'],len(accepted),rejected,'RTX · alineación ICP y localización de superficie (CUDA)',fitness,rmse)
-    timings['alineacion_s']=round(clock()-t0,2); t1=clock()
+    timings['alineacion_s']=round(clock()-t0,2)
+    # Global refinement: every frame is re-aligned against the model built from
+    # ALL frames, a new model is built from those poses, and it is adopted only
+    # if the scan becomes more self-consistent (more depth pixels agree with
+    # the fused surface). Repeated while it improves (max 3 passes).
+    coherence=None
+    if volume is not None and len(accepted)>2:
+        def load(k): return cp.asarray(np.load(inputs/(accepted[k][0]+'-depth.npy')))
+        def score(vol,poses,step=3):
+            agree=[]; median=[]; rows=[]; per={}
+            for k in range(0,len(poses),step):
+                depth_k=load(k); model=vol.raycast(poses[k],accepted[k][2],depth_k.shape,settings.min_depth_m*.8,settings.max_depth_m*1.1)
+                both=(depth_k>0)&(model>0); n=int(cp.count_nonzero(both))
+                if n<100: continue
+                diff=cp.abs(depth_k-model)[both]
+                agree.append(float(cp.count_nonzero(diff<.004))/n); median.append(float(cp.median(diff))); per[k]=(agree[-1],median[-1])
+                rows.append([int(accepted[k][0]),round(agree[-1]*100,1),round(median[-1]*1000,2)])
+            score.rows=rows; score.per=per
+            return (float(np.mean(agree)) if agree else 0.,float(np.median(median))*1000 if median else float('inf'))
+        poses=[entry[1] for entry in accepted]; best=score(volume,poses)
+        coherence={'inicial_%':round(best[0]*100,1),'mediana_inicial_mm':round(best[1],2),'pasadas_aceptadas':0}
+        for _ in range(3):
+            if cancel is not None and cancel.is_set(): raise InterruptedError('Cancelado; sesión original conservada')
+            moved=[]
+            for k,pose in enumerate(poses):
+                depth_k=load(k); model=volume.raycast(pose,accepted[k][2],depth_k.shape,settings.min_depth_m*.8,settings.max_depth_m*1.1)
+                new_pose=pose
+                if int(cp.count_nonzero(model))>=.15*int(cp.count_nonzero(depth_k)):
+                    try:
+                        ok,delta,_,_=register(depth_k,model,accepted[k][2],accepted[k][2],np.eye(4),settings)
+                        if ok and np.linalg.norm(delta[:3,3])<=.02 and rotation_angle(delta)<=5: new_pose=pose@delta
+                    except ValueError: pass
+                moved.append(new_pose)
+                progress(k+1,len(poses),len(accepted),rejected,'RTX · refinamiento global contra el modelo completo (CUDA)',1.,0.)
+            rebuilt=TrackingVolume(np.load(inputs/(accepted[0][0]+'-depth.npy')))
+            for k,pose in enumerate(moved): rebuilt.integrate(load(k),accepted[k][2],pose)
+            candidate_score=score(rebuilt,moved)
+            if candidate_score[0]<=best[0]+.002: break
+            poses,volume,best=moved,rebuilt,candidate_score; coherence['pasadas_aceptadas']+=1
+        # Every frame against the final model: frames that disagree with it
+        # (lost tracking, a hand or person moving, the object moved) are not
+        # fused, so they cannot leave ghost copies. Never more than half.
+        score(volume,poses,1); per=score.per
+        bad=[k for k in range(len(poses)) if k in per and (per[k][0]<.30 or per[k][1]>.010)]
+        if len(bad)>len(poses)//2: bad=[]
+        keep=[k for k in range(len(poses)) if k not in set(bad)]
+        kept=[per[k] for k in keep if k in per]
+        coherence.update({'final_%':round(float(np.mean([a for a,_ in kept]))*100,1) if kept else 0.,
+                          'mediana_final_mm':round(float(np.median([m for _,m in kept]))*1000,2) if kept else float('inf'),
+                          'descartados_incoherentes':len(bad),'fotogramas':score.rows[::3]})
+        if coherence['pasadas_aceptadas'] or bad:
+            accepted=[(accepted[k][0],poses[k].copy(),accepted[k][2],np.linalg.inv(poses[k])) for k in keep]
+            frame_info=[frame_info[k] for k in keep]; noise=[noise[k] for k in keep]
+            keys=cp.empty((0,3),dtype=cp.int64)
+            for k,entry in enumerate(accepted):
+                keys=unique_tiles(cp.concatenate((keys,surface_tile_keys(load(k),entry[2],entry[1],width))))
+        timings['refinamiento_global_s']=round(clock()-t0-timings['alineacion_s'],2)
+        np.save(folder/'poses.npy',np.stack([entry[1] for entry in accepted])); (folder/'poses-frames.json').write_text(json.dumps([int(entry[0]) for entry in accepted]))
+    t1=clock()
     stages.append({'etapa':'Decodificación y rectificación RGB-D','dispositivo':'CPU'})
-    stages.append({'etapa':'ICP punto-plano coarse-to-fine con keyframes','dispositivo':'CUDA'})
+    stages.append({'etapa':'Seguimiento contra el modelo (TSDF 5 mm + ray casting) e ICP punto-plano; keyframes como respaldo','dispositivo':'CUDA'})
+    stages.append({'etapa':'Refinamiento global de poses contra el modelo completo (adoptado solo si mejora la coherencia)','dispositivo':'CUDA'})
     stages.append({'etapa':'Localización de superficie en mosaicos','dispositivo':'CUDA'})
     if settings.rgb_guidance: stages.append({'etapa':'Filtro bilateral guiado por RGB','dispositivo':'CUDA'})
     if settings.neural_denoising: stages.append({'etapa':'Limpieza neuronal de profundidad','dispositivo':'CUDA (PyTorch)'})
@@ -405,6 +526,10 @@ def _reconstruct_tiled(path,settings,progress,cancel,folder):
         value=(None,None,cp.asarray(depth),cp.asarray(rgb))
         cache[name]=value;cache_bytes+=size
         return value
+    # Per-frame TSDF band from the measured registration noise (first frame:
+    # median of the others).
+    measured=np.array(noise,dtype=np.float64); fallback_noise=float(np.nanmedian(measured)) if np.isfinite(measured).any() else 0.
+    bands=[truncation(voxel,fallback_noise if not np.isfinite(n) else n) for n in measured]
     # Vectorized visibility: one matrix product per tile for all frames.
     inverses=np.stack([entry[3] for entry in accepted])                 # (N,4,4) world->camera
     intrinsics_all=np.array([entry[2] for entry in accepted],dtype=np.float64)
@@ -431,7 +556,7 @@ def _reconstruct_tiled(path,settings,progress,cancel,folder):
             frames=[]
             for k in chunk:
                 _,_,gpu_depth,gpu_rgb=prepared(accepted[k][0])
-                frames.append((gpu_depth,gpu_rgb,extrinsics[k],accepted[k][2],int(widths[k]),int(heights[k])))
+                frames.append((gpu_depth,gpu_rgb,extrinsics[k],accepted[k][2],int(widths[k]),int(heights[k]),bands[k]))
             tile.integrate_many(frames); launches+=1
         minimum=max(1.,settings.min_observations)
         vertices,colors=tile.mesh(minimum)
@@ -464,11 +589,11 @@ def _reconstruct_tiled(path,settings,progress,cancel,folder):
     stages.append({'etapa':'Soldadura de la malla de visualización','dispositivo':'CUDA'})
     stages.append({'etapa':'Escritura de mosaicos y exportación','dispositivo':'CPU (E/S)'})
     report={'settings':__import__('dataclasses').asdict(settings),'captured':metadata,'accepted':len(accepted),'rejected':rejected,
-            'keyframes':keyframes,'keyframe_fallbacks':int(fallback),'tracking_only_frames':int(tracked),
+            'keyframes':keyframes,'keyframe_fallbacks':int(fallback),'tracking_only_frames':int(tracked),'model_tracked_frames':int(model_tracked),'model_refined_frames':int(refined_frames),'relocalized_frames':int(relocalized),
             'device':'CUDA: ICP + localización + TSDF + Marching Cubes',
             'gpu_name':cp.cuda.runtime.getDeviceProperties(0)['name'].decode(),
             'stages':stages,'cpu_tasks':['decodificación y rectificación RGB-D','selección de vistas por mosaico (escalares)','E/S de disco'],
-            'disk_estimate_gb':round(estimate/1024**3,2),'vram_pool_peak_mb':round(peak/1024**2,1),'timings':timings,'fusion_kernel_launches':launches,
+            'disk_estimate_gb':round(estimate/1024**3,2),'vram_pool_peak_mb':round(peak/1024**2,1),'timings':timings,'fusion_kernel_launches':launches,'coherencia':coherence,'tsdf_band_mm':{'min':round(min(bands)*1000,2),'median':round(float(np.median(bands))*1000,2),'max':round(max(bands)*1000,2)},
             'registration':'CUDA projective point-to-plane coarse-to-fine, alineación a keyframe',
             'resolution_note':'resolution_mm es el tamaño de vóxel de la reconstrucción, no la precisión física del sensor TrueDepth.',
             'vertices':total*3,'triangles':total,'tiles':len(keys),'view_levels':saved,'folder':str(folder)}
